@@ -1,0 +1,13 @@
+train: ../train/images
+val: ../valid/images
+test: ../test/images
+
+nc: 1
+names: ['carplates']
+
+roboflow:
+  workspace: dataset-6jkf5
+  project: kz-carplate-numbers-27oey
+  version: 1
+  license: CC BY 4.0
+  url: https://universe.roboflow.com/dataset-6jkf5/kz-carplate-numbers-27oey/dataset/1

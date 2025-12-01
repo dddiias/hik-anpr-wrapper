@@ -1,0 +1,8 @@
+# ПУТИ ОТНОСИТЕЛЬНО ПАПКИ САМГО YAML (dataset/cars-plate-kz)
+
+train: train/images
+val: train/images   # пока используем те же картинки как валидацию, потом сделаем нормальный split
+
+nc: 1
+names:
+  - license_plate
