@@ -1,48 +1,72 @@
 # ocr.py
-from typing import Tuple, Optional
+from __future__ import annotations
 
-import cv2
+from typing import Tuple
+
+import numpy as np
 from paddleocr import PaddleOCR
-
-from plate_rules import normalize_plate
 
 
 class PlateOCR:
     """
-    Обёртка над PaddleOCR + нормализация под KZ форматы.
+    Класс-обёртка над PaddleOCR, заточенный именно под распознавание номера.
+    ВАЖНО: используем только rec (распознавание), детекцию текста отключаем.
     """
 
     def __init__(self) -> None:
-        # Важно: в твоей версии paddleocr нет параметра show_log,
-        # поэтому оставляем только поддерживаемые аргументы.
+        """
+        Инициализация OCR-движка.
+        """
+        # Детектор текста нам не нужен, мы подаём уже вырезанный номер.
         self.ocr = PaddleOCR(
             lang="en",
             use_angle_cls=False,
-            # show_log=False  # <-- убрали, он и ломал запуск
+            det=False,   # детектор не нужен
+            rec=True,
         )
 
-    def recognize(self, img) -> Tuple[Optional[str], float]:
+    def recognize(self, img: np.ndarray) -> Tuple[str, float]:
         """
-        img: numpy-картинка (BGR или grayscale) – кроп номерного знака
-        Возвращает: (plate: str | None, ocr_conf: float)
+        Распознать текст на уже обрезанном изображении номера.
+
+        :param img: numpy-изображение (BGR или RGB — PaddleOCR сам разберётся).
+        :return: (plate_text, confidence)
         """
-        # PaddleOCR ожидает BGR
-        if img.ndim == 2:
-            img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+        # ЯВНО отключаем детекцию и классификатор угла — только распознавание
+        result = self.ocr.ocr(img, det=False, rec=True, cls=False)
 
-        result = self.ocr.ocr(img)
-        if not result or not result[0]:
-            # OCR вообще ничего не увидел
-            return None, 0.0
+        # Иногда PaddleOCR может вернуть пустой список, если ничего не увидел
+        if not result:
+            return "", 0.0
 
-        # Стандартный формат ответа: result[0][0] = [bbox, (text, score)]
-        text, score = result[0][0][1]
+        first = result[0]
 
-        # Нормализуем строку под форматы гос-номеров РК
-        plate = normalize_plate(text)
+        # У разных конфигураций PaddleOCR структура может отличаться.
+        # Сделаем универсальный поиск пары вида (str, float) внутри результата.
+        def find_text_score(node):
+            if isinstance(node, (list, tuple)):
+                # Классический формат: ("TEXT", score)
+                if (
+                    len(node) == 2
+                    and isinstance(node[0], str)
+                    and isinstance(node[1], (float, int))
+                ):
+                    return node[0], float(node[1])
+                # Рекурсивно обходим все вложенные элементы
+                for child in node:
+                    found = find_text_score(child)
+                    if found is not None:
+                        return found
+            return None
 
-        if plate is None:
-            # OCR что-то увидел, но формат не похож на гос-номер
-            return None, float(score)
+        pair = find_text_score(first)
+        if pair is None:
+            # Ничего не смогли достать — считаем, что распознавания нет
+            return "", 0.0
 
-        return plate, float(score)
+        text, score = pair
+
+        # Нормализуем: избавляемся от пробелов, переводим в верхний регистр
+        text = text.replace(" ", "").upper()
+
+        return text, float(score)

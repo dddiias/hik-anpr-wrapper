@@ -9,6 +9,8 @@ import numpy as np
 from ultralytics import YOLO
 
 from ocr import PlateOCR
+from plate_rules import normalize_plate   # <<< вот это добавляем
+
 
 
 ImageType = Union[str, np.ndarray]
@@ -22,7 +24,7 @@ class DetectionResult:
     bbox: Optional[Tuple[int, int, int, int]]
 
 
-def preprocess_plate(img: np.ndarray) -> np.ndarray:
+def preprocess_plate(img: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     """
     Жёсткая предобработка маленького номера:
     - серое изображение
@@ -46,6 +48,7 @@ def preprocess_plate(img: np.ndarray) -> np.ndarray:
     # Выравниваем контраст
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     clahe_img = clahe.apply(gray)
+    clahe_bgr = cv2.cvtColor(clahe_img, cv2.COLOR_GRAY2BGR)
 
     # Сглаживаем шум, но сохраняем границы
     blur = cv2.bilateralFilter(clahe_img, d=9, sigmaColor=75, sigmaSpace=75)
@@ -67,7 +70,7 @@ def preprocess_plate(img: np.ndarray) -> np.ndarray:
     cv2.imwrite("debug_raw_crop.jpg", img)
     cv2.imwrite("debug_proc_crop.jpg", proc)
 
-    return proc
+    return proc, clahe_bgr
 
 
 class ANPR:
@@ -143,16 +146,36 @@ class ANPR:
 
         plate_crop = image[y1:y2, x1:x2]
 
-        # 2. Предобработка кропа
-        proc_crop = preprocess_plate(plate_crop)
+        # 2. ????????????? ????? (??? ????????: ?????? CLAHE ? ????????)
+        proc_crop, clahe_crop = preprocess_plate(plate_crop)
 
-        # 3. OCR
-        plate, ocr_conf = self.ocr.recognize(proc_crop)
+        # 3. OCR ?? ????? ?????????, ???????? ???????? ????? KZ ? ????????? ????????????
+        ocr_trials = []
+        for variant_name, crop in (("clahe", clahe_crop), ("binary", proc_crop)):
+            raw_plate, ocr_conf = self.ocr.recognize(crop)
+            normalized_plate = normalize_plate(raw_plate)
+            ocr_trials.append((variant_name, raw_plate, normalized_plate, ocr_conf))
+
+        best_norm = None
+        best_conf = 0.0
+        for _, _, normalized_plate, ocr_conf in ocr_trials:
+            if normalized_plate is None:
+                continue
+            if normalized_plate == best_norm:
+                best_conf = max(best_conf, ocr_conf)
+            elif ocr_conf > best_conf:
+                best_norm = normalized_plate
+                best_conf = ocr_conf
+
+        plate_final = best_norm  # None ???? ?????? ?????????
+        ocr_conf_final = best_conf if best_norm is not None else max(
+            (conf for _, _, _, conf in ocr_trials), default=0.0
+        )
 
         result = DetectionResult(
-            plate=plate,
+            plate=plate_final,
             det_conf=det_conf,
-            ocr_conf=ocr_conf,
+            ocr_conf=ocr_conf_final,
             bbox=(x1, y1, x2, y2),
         )
 

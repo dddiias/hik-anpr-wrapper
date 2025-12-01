@@ -22,7 +22,7 @@ PATTERNS = [
         re.compile(r"^(?P<num>\d{3})(?P<letters>[A-Z]{2})(?P<reg>\d{2})$"),
     ),
 
-    # Тип 2: грузовые/такси жёлтые – буква серии + 4 цифры + 2 цифры (регион)
+    # Тип 2: грузовые/такси – буква серии + 4 цифры + 2 цифры (регион)
     # A444501, H444501, M123456 и т.п.
     (
         "type2_truck",
@@ -105,19 +105,11 @@ def try_fix_confusions(text: str) -> str:
     return text  # ничего не нашли – оставляем как есть
 
 
-def normalize_plate(raw_text: str) -> Optional[str]:
+def _normalize_single(text: str) -> Optional[str]:
     """
-    На вход – сырая строка от OCR.
-    На выход – нормализованный номер (например '850ZEX15')
-    или None, если строка не похожа на казахстанский номер.
+    Нормализация одной "чистой" строки (только A-Z0-9) без мусора слева/справа.
+    Возвращает нормализованный номер или None.
     """
-    if not raw_text:
-        return None
-
-    text = clean_ocr_text(raw_text)
-    if not text:
-        return None
-
     text = try_fix_confusions(text)
 
     res = match_plate(text)
@@ -143,3 +135,42 @@ def normalize_plate(raw_text: str) -> Optional[str]:
 
     # На всякий случай fallback
     return text
+
+
+def normalize_plate(raw_text: str) -> Optional[str]:
+    """
+    На вход – сырая строка от OCR (может содержать мусор слева/справа, типа 'PA654WOZ05').
+    На выход – нормализованный номер ('654WOZ05') или None.
+    """
+    if not raw_text:
+        return None
+
+    text = clean_ocr_text(raw_text)
+    if not text:
+        return None
+
+    # 1) Сначала пробуем всю строку целиком
+    candidate = _normalize_single(text)
+    if candidate is not None:
+        return candidate
+
+    # 2) Если не получилось – ищем номер как ПОДСТРОКУ
+    n = len(text)
+    # Реальные длины казахских номеров – примерно 6..8 символов.
+    MIN_LEN = 6
+    MAX_LEN = 9
+
+    best: Optional[str] = None
+
+    for i in range(n):
+        for j in range(i + MIN_LEN, min(n, i + MAX_LEN) + 1):
+            if j <= i:
+                continue
+            sub = text[i:j]
+            cand = _normalize_single(sub)
+            if cand is not None:
+                # Берём самый "длинный" кандидат (чаще всего он правильный)
+                if best is None or len(cand) > len(best):
+                    best = cand
+
+    return best
