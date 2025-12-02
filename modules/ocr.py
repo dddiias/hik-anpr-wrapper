@@ -32,11 +32,10 @@ class PlateOCR:
         )
 
     def _prepare_image(self, img: np.ndarray) -> np.ndarray:
-        """Нормализуем изображение под PaddleOCR (RGB uint8, не слишком мелкое)."""
         if img is None or img.size == 0:
             return img
 
-        # приводим к RGB
+        # 1) BGR -> RGB
         if img.ndim == 2:
             img_rgb = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
         else:
@@ -44,14 +43,20 @@ class PlateOCR:
 
         h, w = img_rgb.shape[:2]
 
-        # если номер очень маленький — немного увеличим
-        if max(h, w) < 64:
-            scale = 64.0 / max(h, w)
+        # 2) деликатное масштабирование: хотим ширину ~220–260 px
+        target_w = 240
+        scale = target_w / max(w, 1)
+        if scale > 1.0:  # только увеличиваем, не уменьшаем
             new_w = int(w * scale)
             new_h = int(h * scale)
-            img_rgb = cv2.resize(img_rgb, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+            img_rgb = cv2.resize(img_rgb, (new_w, new_h), interpolation=cv2.INTER_CUBIC)
 
-        return img_rgb
+        # 3) лёгкий Gaussian blur + unsharp mask
+        blur = cv2.GaussianBlur(img_rgb, (3, 3), 0)
+        sharp = cv2.addWeighted(img_rgb, 1.5, blur, -0.5, 0)
+
+        return sharp
+
 
     def recognize(self, img: np.ndarray) -> Tuple[str, float]:
         """
