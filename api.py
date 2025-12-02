@@ -6,7 +6,7 @@ import numpy as np
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import JSONResponse
 
-from anpr import ANPR
+from modules.anpr import ANPR
 
 app = FastAPI(
     title="Hikvision ANPR Wrapper",
