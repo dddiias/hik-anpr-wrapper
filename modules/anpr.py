@@ -4,6 +4,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple, Union
 
+import os
+from datetime import datetime
+
 import cv2
 import numpy as np
 from ultralytics import YOLO
@@ -95,6 +98,7 @@ class ANPR:
         """
         self.yolo = YOLO(yolo_weights)
         self.ocr = PlateOCR()
+        self.det_conf_thr = 0.15
 
     def _load_image(self, img: ImageType) -> np.ndarray:
         if isinstance(img, str):
@@ -116,9 +120,19 @@ class ANPR:
         h, w = image.shape[:2]
 
         # 1. Детекция номерного знака YOLO
-        det_result = self.yolo(image, verbose=False)[0]
+        det_result = self.yolo(image, conf=self.det_conf_thr, verbose=False)[0]
+
+        # 🔴 если ничего не нашли — логируем и сохраняем кадр
         if det_result.boxes is None or len(det_result.boxes) == 0:
-            # Ничего не нашли
+            os.makedirs("debug_no_det", exist_ok=True)
+
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            debug_name = f"no_det_{ts}.jpg"
+            debug_path = os.path.join("debug_no_det", debug_name)
+
+            cv2.imwrite(debug_path, image)
+            print(f"[ANPR] no plate detected, saved: {debug_path}")
+
             return DetectionResult(
                 plate=None,
                 det_conf=0.0,
