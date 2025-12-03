@@ -1,9 +1,10 @@
 ﻿# Hikvision ANPR Wrapper
 
-Обертка над пайплайном распознавания госномеров (детекция → кроп → OCR) для камер Hikvision. Используются YOLOv8 для поиска номера (`runs/detect/train4/weights/best.pt`) и PaddleOCR для чтения текста с нормализацией казахстанских шаблонов.
+Обертка над пайплайном распознавания госномеров (детекция -> кроп -> OCR) для камер Hikvision. Используются YOLOv8 для поиска номера (`runs/detect/train4/weights/best.pt`) и PaddleOCR для чтения текста с нормализацией казахстанских шаблонов.
 
 ## Возможности
 - HTTP API на FastAPI (`api.py`) с эндпойнтами `GET /health` и `POST /anpr`.
+- Эндпойнт `POST /api/v1/anpr/hikvision` для прямых запросов с камер Hikvision: понимает `multipart/form-data` и сырые JPEG-байты, сохраняет все тела/части в `hik_raws/<YYYY-MM-DD>/{raws,parts,images}`.
 - Класс `ANPR` для вызова из Python: принимает путь к файлу или `numpy.ndarray`, возвращает `dict` с полями `plate`, `det_conf`, `ocr_conf`, `bbox`.
 - Можно отдельно использовать детектор (`modules/detector.py`) или OCR (`modules/ocr.py`).
 - Примеры изображений: `img/sample.jpg`, `img/test/*.jpg`; веса YOLO уже лежат в `runs/detect/train4/weights/best.pt`.
@@ -23,11 +24,38 @@ pip install -r requirements.txt
 ```bash
 uvicorn api:app --host 0.0.0.0 --port 8000
 ```
-Проверка запроса:
+
+### Обычный REST-запрос
 ```bash
 curl -X POST -F "file=@img/sample.jpg" http://localhost:8000/anpr
 ```
 Ответ: `{"plate":"850ZEX15","det_conf":0.87,"ocr_conf":0.91,"bbox":[x1,y1,x2,y2]}`.
+
+### Hikvision-эндпойнт `/api/v1/anpr/hikvision`
+- Если камера шлет `multipart/form-data`, сырое тело запроса кладется в `hik_raws/<date>/raws`, каждый part записывается в `.../parts`, а все картинки — в `.../images`.
+- Если камера отправляет только JPEG в теле запроса, файл сохраняется в `.../images` и отправляется в пайплайн.
+- Пример запроса с файлом (имя поля не важно):
+```bash
+curl -X POST -F "frame=@img/sample.jpg" http://localhost:8000/api/v1/anpr/hikvision
+```
+- Пример ответа для multipart:
+```json
+{
+  "status": "ok",
+  "kind": "multipart_with_files",
+  "files": [
+    {
+      "field": "frame",
+      "filename": "hik_raws/2025-12-04/images/12-34-56_123456_sample.jpg",
+      "plate": "850ZEX15",
+      "det_conf": 0.87,
+      "ocr_conf": 0.91,
+      "bbox": [x1, y1, x2, y2]
+    }
+  ]
+}
+```
+В зависимости от содержимого запроса `kind` может быть `multipart_no_files`, `multipart_with_files`, `jpeg_in_body` или `no_jpeg_in_body` — это помогает диагностировать формат, который приходит с камеры.
 
 ## Локальный инференс из кода
 ```python
@@ -51,15 +79,17 @@ for det in detector.detect(img, conf=0.25):
 ```
 
 ## Структура проекта
-- `api.py` — FastAPI обертка.
+- `api.py` — FastAPI-обертка, включая hikvision-эндпойнт.
 - `modules/anpr.py` — основной пайплайн: детекция, препроцессинг, OCR.
 - `modules/ocr.py` — обертка над PaddleOCR.
 - `modules/detector.py` — отдельный YOLOv8-детектор.
 - `limitations/plate_rules.py` — нормализация и валидаторы форматов KZ.
 - `runs/detect/train4/weights/best.pt` — обученные веса YOLO.
 - `img/` — примеры и тестовые изображения.
+- `hik_raws/` — дата-каталоги с сырым телом и извлеченными файлами/картинками от камер.
 - `tests/` — скрипты-проверки; при необходимости поправьте пути к картинкам.
 
 ## Отладочные файлы
 - Последний crop и бинаризация сохраняются в `debug_raw_crop.jpg` и `debug_proc_crop.jpg`.
 - При отсутствии детекции исходное изображение складывается в `debug_no_det/no_det_*.jpg`.
+- Hikvision-запросы и извлеченные части сохраняются в `hik_raws/<date>`, их можно чистить при необходимости, чтобы не разрастался диск.

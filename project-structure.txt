@@ -1,5 +1,6 @@
 ﻿.\.venv
 .\datasets
+.\hik_raws
 .\img
 .\limitations
 .\models
@@ -9,9 +10,8 @@
 .\__pycache__
 .\.gitignore
 .\api.py
-.\debug_proc_crop.jpg
-.\debug_raw_crop.jpg
 .\project-structure.txt
+.\README.md
 .\requirements.txt
 .\yolov8n.pt
 .\img\test
