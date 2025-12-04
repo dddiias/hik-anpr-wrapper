@@ -106,7 +106,7 @@ async def hikvision_isapi(request: Request):
             if hasattr(value, "filename"):
                 found_files += 1
                 file_bytes = await value.read()
-                fname = value.filename or f"hik_file_{ts}_{found_files}.bin"
+                fname = value.filename or f"hik_file_{time_str}_{found_files}.bin"
                 ftype = value.content_type or "application/octet-stream"
 
                 print(
@@ -128,7 +128,7 @@ async def hikvision_isapi(request: Request):
                         # сохраняем исходный кадр
                         img_path = IMAGES_DIR / f"{time_str}_{fname}"
 
-                        cv2.imwrite(str(img_path))
+                        cv2.imwrite(str(img_path), img)
                         print(f"[HIK] image saved to {img_path}")
 
                         anpr_res = engine.infer(img)
