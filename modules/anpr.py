@@ -126,7 +126,7 @@ class ANPR:
         if det_result.boxes is None or len(det_result.boxes) == 0:
             os.makedirs("debug_no_det", exist_ok=True)
 
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            ts = datetime.now().strftime("%Y-%m-%d_%H%M%S")
             debug_name = f"no_det_{ts}.jpg"
             debug_path = os.path.join("debug_no_det", debug_name)
 
