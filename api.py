@@ -159,9 +159,9 @@ async def send_to_upstream(
 
     Возвращает:
       {
-        "sent": bool,          # удалось ли отправить
-        "status": int | None,  # HTTP-статус ответа, если был
-        "error": str | None,   # текст ошибки, если была
+        "sent": bool,
+        "status": int | None,
+        "error": str | None,
       }
     """
     if not UPSTREAM_URL:
@@ -175,14 +175,22 @@ async def send_to_upstream(
 
     try:
         # event — как строка JSON в поле формы
+        event_str = json.dumps(event_data, ensure_ascii=False)
         data = {
-            "event": json.dumps(event_data, ensure_ascii=False),
+            "event": event_str,
         }
+
+        print("[UPSTREAM] EVENT JSON:")
+        print(event_str)
 
         # photos — список файлов под одним и тем же ключом "photos"
         files = []
 
         if detection_bytes:
+            print(
+                f"[UPSTREAM] add photo: field='photos', name='detectionPicture.jpg', "
+                f"size={len(detection_bytes)}"
+            )
             files.append(
                 (
                     "photos",
@@ -191,6 +199,10 @@ async def send_to_upstream(
             )
 
         if feature_bytes:
+            print(
+                f"[UPSTREAM] add photo: field='photos', name='featurePicture.jpg', "
+                f"size={len(feature_bytes)}"
+            )
             files.append(
                 (
                     "photos",
@@ -199,6 +211,10 @@ async def send_to_upstream(
             )
 
         if license_bytes:
+            print(
+                f"[UPSTREAM] add photo: field='photos', name='licensePlatePicture.jpg', "
+                f"size={len(license_bytes)}"
+            )
             files.append(
                 (
                     "photos",
@@ -309,14 +325,32 @@ async def hikvision_isapi(request: Request):
                 # текстовые части (если будут) — просто логируем
                 print(f"[HIK] form field: {key} = {value}")
 
-        # 4) Формируем базовый JSON-события
+        # === Формируем JSON-событие в простом виде ===
+
+        now_iso = datetime.datetime.now().isoformat()
+
+        camera_plate = camera_info.get("plate")
+        camera_conf = camera_info.get("confidence")
+        event_time = camera_info.get("date_time") or now_iso
+
+        # основной номер события для поля plate (обязателен для бэкенда)
+        main_plate = model_plate or camera_plate
+
         event_data: Dict[str, Any] = {
-            "timestamp": datetime.datetime.now().isoformat(),
-            "camera_plate": camera_info.get("plate"),
-            "camera_confidence": camera_info.get("confidence"),
-            "anpr_plate": model_plate,
-            "anpr_det_conf": model_det_conf,
-            "anpr_ocr_conf": model_ocr_conf,
+            # контракт бэкенда
+            "camera_id": "camera-001",  # TODO: подставь реальный ID камеры
+            "event_time": event_time,
+            "plate": main_plate,
+
+            # понятные поля
+            "camera_plate": camera_plate,
+            "camera_confidence": camera_conf,
+            "model_plate": model_plate,
+            "model_det_conf": model_det_conf,
+            "model_ocr_conf": model_ocr_conf,
+
+            # доп. служебное время
+            "timestamp": now_iso,
         }
 
         # 5) Отправляем JSON + фото на внешний сервис и получаем результат
@@ -389,14 +423,21 @@ async def hikvision_isapi(request: Request):
     model_ocr_conf = anpr_res.get("ocr_conf")
     model_bbox = anpr_res.get("bbox")
 
-    # Формируем событие для fallback
+    now_iso = datetime.datetime.now().isoformat()
+
+    # тут камеры нет, только модель
+    main_plate = model_plate
+
     event_data: Dict[str, Any] = {
-        "timestamp": datetime.datetime.now().isoformat(),
+        "camera_id": "camera-001",
+        "event_time": now_iso,
+        "plate": main_plate,
         "camera_plate": None,
         "camera_confidence": None,
-        "anpr_plate": model_plate,
-        "anpr_det_conf": model_det_conf,
-        "anpr_ocr_conf": model_ocr_conf,
+        "model_plate": model_plate,
+        "model_det_conf": model_det_conf,
+        "model_ocr_conf": model_ocr_conf,
+        "timestamp": now_iso,
     }
 
     # Отправляем только одну картинку как detection_picture

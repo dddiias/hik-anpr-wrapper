@@ -1,109 +1,106 @@
 # Hikvision ANPR Wrapper
 
-Обертка над пайплайном распознавания госномеров (детекция -> кроп -> OCR) для камер Hikvision и обычных HTTP-клиентов. Детекция работает на YOLOv8 (`runs/detect/train4/weights/best.pt`), чтение текста — через PaddleOCR с нормализацией казахстанских форматов.
+FastAPI‑сервис, который принимает события от камер Hikvision, прогоняет изображение через свою модель распознавания номерных знаков (YOLOv8 + PaddleOCR) и при необходимости пересылает событие в другой сервис в виде `multipart/form-data`.
 
-## Что умеет
-- FastAPI API (`api.py`): `GET /health`, `POST /anpr`, `POST /api/v1/anpr/hikvision`.
-- Пайплайн: YOLOv8 ищет номер, кроп нормализуется, PaddleOCR читает текст, `limitations/plate_rules.py` приводит результат к валидным шаблонам KZ (регионы 01-20).
-- Примеры изображений лежат в `img/`, веса YOLO - в `runs/detect/train4/weights/best.pt`.
-- Можно использовать как библиотеку (`modules/anpr.ANPR`) или только детектор (`modules/detector.PlateDetector`).
-- Hikvision-эвенты форвардятся наружу на `UPSTREAM_URL` как multipart: поле `event` (JSON) + массив `photos` (detection/feature/licensePicture).
-
-## Как работает пайплайн
-1) YOLOv8 с порогом `det_conf_thr=0.15` выбирает bbox с максимальной уверенностью. При отсутствии детекции исходник сохраняется в `debug_no_det/no_det_<timestamp>.jpg`, ответ — с `plate=None`.  
-2) Кроп ресайзится до ~240 px по большей стороне, проходит CLAHE, блюр, морфологию; сохраняются `debug_raw_crop.jpg` (сырой кроп) и `debug_proc_crop.jpg` (бинаризация).  
-3) OCR (PaddleOCR, CPU): две попытки — по CLAHE-кропу и по бинарному; логируются в консоль, берется лучший вариант.  
-4) Нормализация номера: чистка символов, исправление путаниц (O/0, S/5, 2/Z, 8/B), проверка форматов KZ и регионов 01..20.  
-5) Результат `dict`: `plate`, `det_conf`, `ocr_conf`, `bbox=(x1,y1,x2,y2)`.
+## Что внутри
+- `api.py` — HTTP API: `GET /health`, `POST /anpr`, `POST /api/v1/anpr/hikvision`.
+- `modules/anpr.ANPR` — пайплайн: детекция номера YOLOv8 (`runs/detect/train4/weights/best.pt`), препроцессинг кадра, OCR (PaddleOCR), нормализация под номера РК (`limitations/plate_rules.py`).
+- `modules/detector.PlateDetector` — обертка над YOLO для детекции номера без OCR.
+- Входные артефакты камер складываются в `hik_raws/<YYYY-MM-DD>/parts` (XML) и `hik_raws/<YYYY-MM-DD>/images` (зарезервировано), логи отправок — `hik_raws/detections.log`.
 
 ## Установка
-1) Python 3.11.8.  
-2) Виртуальное окружение и зависимости:
+Требуется Python 3.11.8.
 ```bash
 python -m venv .venv
 .\.venv\Scripts\activate
 pip install --upgrade pip
 pip install -r requirements.txt
 ```
-> При первом запуске PaddleOCR скачает модели (~200 МБ), потребуется интернет.
+> PaddleOCR подтянет весовые файлы при первом запуске (скачивание ~200 МБ).
 
 ## Запуск API
 ```bash
 uvicorn api:app --host 0.0.0.0 --port 8000
 ```
+Значение апстрима настраивается в `api.py` через константу `UPSTREAM_URL`. Если оставить пустой строкой, события наружу не отправляются, но продолжают логироваться.
 
+## Эндпоинты
 ### `GET /health`
-Простой healthcheck: `{"status":"ok"}`.
+Проверка доступности. Ответ: `{"status": "ok"}`.
 
 ### `POST /anpr`
-- Ожидает `multipart/form-data` с полем `file` (JPEG/PNG).  
-- Возвращает результат пайплайна: `{"plate":"850ZEX15","det_conf":0.87,"ocr_conf":0.91,"bbox":[x1,y1,x2,y2]}`.  
-- Ошибки: пустой файл (`400 Empty file`), не удалось декодировать изображение (`400 Cannot decode image`).
+Одно изображение на вход, распознанный номер на выходе.
+- Тело: `multipart/form-data`, поле `file` (JPEG/PNG).
+- Успешный ответ: `{"plate":"850ZEX15","det_conf":0.87,"ocr_conf":0.91,"bbox":[x1,y1,x2,y2]}`.
+- Ошибки: `400 Empty file`, `400 Cannot decode image`.
 Пример:
 ```bash
 curl -X POST -F "file=@img/sample.jpg" http://localhost:8000/anpr
 ```
 
 ### `POST /api/v1/anpr/hikvision`
-Принимает нативные запросы камер Hikvision. Поддерживает два режима и создает каталоги `hik_raws/<YYYY-MM-DD>/parts` (сохраняется только `anpr.xml`; `images/` создается, но сейчас не используется).
+Точка приёма webhook от Hikvision. Поддерживаются два формата запроса:
+1) **Стандартный multipart от камеры.**
+   - `anpr.xml` — сохраняется в `hik_raws/<date>/parts/<time>_anpr.xml`, парсятся поля `licensePlate`/`originalLicensePlate`, `confidenceLevel`, `eventType`, `dateTime`.
+   - `detectionPicture.jpg` — используется как основное изображение для своей ANPR-модели.
+   - `featurePicture.jpg`, `licensePlatePicture.jpg` — дополнительные кадры, просто пробрасываются дальше.
+   - Любые текстовые поля формы печатаются в лог (stdout).
+2) **Fallback: JPEG прямо в теле** (для случаев без multipart). Из тела вырезается первый JPEG, остальной контент игнорируется.
 
-**Ожидаемые части multipart/form-data**
-- `anpr.xml` — сохраняется в `hik_raws/<date>/parts/<time>_anpr.xml`, парсятся `licensePlate`, `originalLicensePlate`, `confidenceLevel`, `eventType`, `dateTime`.  
-- `detectionPicture.jpg` — запускает ANPR, чтобы заполнить `anpr_*`; байты уходят наружу.  
-- `featurePicture.jpg`, `licensePlatePicture.jpg` — просто форвардятся наружу.  
-- Остальные поля игнорируются (только логируются в stdout).
+Общий поток обработки:
+1. Если пришёл `detectionPicture.jpg`, запускается `ANPR.infer()`; без него модель не вызывается.
+2. Формируется `event_data`:
+   - `camera_id` — всегда `"camera-001"` (зашито, при необходимости поменяйте в `api.py`).
+   - `event_time` — `dateTime` из XML, иначе текущее время.
+   - `plate` — приоритетно модель (`model_plate`), иначе номер из камеры.
+   - `camera_plate`, `camera_confidence` — из XML; могут быть `null`.
+   - `model_plate`, `model_det_conf`, `model_ocr_conf` — из собственной модели; `null`, если модель не запускалась.
+   - `timestamp` — текущее время формирования события.
+3. Событие отправляется в апстрим (`send_to_upstream`), результат фиксируется в `hik_raws/detections.log` вместе со статусом отправки (`upstream_sent`, `upstream_status`, `upstream_error`). В fallback‑режиме в лог дополнительно пишется `anpr_bbox`.
+4. Ответ сервиса — `{"status": "ok"}`. Если JPEG не извлечён из тела — тоже `ok` (ничего не отправляется). При невозможности декодировать JPEG — `{"status":"error","message":"cannot decode jpeg"}` с кодом 400.
 
-**Форвардинг события наружу**  
-- `UPSTREAM_URL` в `api.py` указывает сервис получателя (`https://snowops-anpr-service.onrender.com/api/v1/anpr/events`).  
-- Отправляется `multipart/form-data` с полями:  
-  - `event` — JSON (`timestamp`, `camera_plate`, `camera_confidence`, `anpr_plate`, `anpr_det_conf`, `anpr_ocr_conf`);  
-  - `photos` — массив файлов: detectionPicture/featurePicture/licensePlatePicture (что пришло, то и уходит); для fallback JPEG кладется в `photos` как detectionPicture.  
-- Таймаут отправки 10 секунд. Чтобы отключить форвардинг, поставьте `UPSTREAM_URL = ""`.
+Пример запроса отлаженного multipart:
+```bash
+curl -X POST http://localhost:8000/api/v1/anpr/hikvision ^
+  -F "anpr.xml=@hik_raws/2025-12-06/parts/sample_anpr.xml;type=text/xml" ^
+  -F "detectionPicture.jpg=@img/sample.jpg;type=image/jpeg" ^
+  -F "featurePicture.jpg=@img/sample.jpg;type=image/jpeg"
+```
 
-**Локальное логирование**  
-- В `hik_raws/detections.log` одна JSON-строка на запрос: все поля `event`, плюс `upstream_sent`, `upstream_status`, `upstream_error`.  
-- Для кейсов без JPEG в теле и ошибок декодирования тоже пишутся записи с `kind=no_jpeg_in_body`/`jpeg_decode_error`.
+## Формат отправки в внешний сервис
+`send_to_upstream` делает `POST {UPSTREAM_URL}` с `multipart/form-data`:
+- Поле `event` — строка JSON с вышеописанной структурой `event_data`.
+- Поле (повторяющееся) `photos` — JPEG-файлы:
+  - `detectionPicture.jpg` — основное изображение (если было в запросе, либо JPEG из тела при fallback).
+  - `featurePicture.jpg` — если камера прислала.
+  - `licensePlatePicture.jpg` — если камера прислала.
 
-**Ответы API**
-- Multipart: всегда `{"status": "ok"}` (детали только в логе и отправке наружу).  
-- Body-JPEG fallback: если JPEG не найден — `{"status": "ok"}` (и запись в лог о `no_jpeg_in_body`); если JPEG не декодируется — `{"status": "error", "message": "cannot decode jpeg"}`; если декодируется — `{"status": "ok"}` (детали в логе и форвардинге).
+Пример полезной нагрузки `event` при multipart:
+```json
+{
+  "camera_id": "camera-001",
+  "event_time": "2025-12-06T15:20:18",
+  "plate": "850ZEX15",
+  "camera_plate": "850ZEX15",
+  "camera_confidence": 0.83,
+  "model_plate": "850ZEX15",
+  "model_det_conf": 0.91,
+  "model_ocr_conf": 0.89,
+  "timestamp": "2025-12-06T15:20:19.123456"
+}
+```
+В fallback‑режиме `camera_plate` и `camera_confidence` будут `null`, `event_time` = текущее время, фотография — единственный `detectionPicture.jpg` из тела.
 
-## Использование из Python
+## Отладочные файлы
+- `debug_raw_crop.jpg`, `debug_proc_crop.jpg` — последний raw/обработанный кроп номера из OCR.
+- `debug_no_det/` — исходные кадры, где YOLO не нашла номер.
+- `hik_raws/detections.log` — построчно JSON событий и статусов отправки.
+
+## Использование как библиотеки
 ```python
 from modules.anpr import ANPR
 
-engine = ANPR()  # по умолчанию берет runs/detect/train4/weights/best.pt
-res = engine.infer("img/sample.jpg")  # можно передать и numpy.ndarray (BGR)
-print(res)  # {'plate': '850ZEX15', 'det_conf': ..., 'ocr_conf': ..., 'bbox': [...]}
+engine = ANPR()  # можно передать yolo_weights="path/to/weights.pt"
+result = engine.infer("img/sample.jpg")  # либо np.ndarray (BGR)
+print(result)  # {'plate': '850ZEX15', 'det_conf': ..., 'ocr_conf': ..., 'bbox': [...]}
 ```
-
-### Детектор отдельно
-```python
-from modules.detector import PlateDetector
-import cv2
-
-detector = PlateDetector("runs/detect/train4/weights/best.pt")
-img = cv2.imread("img/sample.jpg")
-for det in detector.detect(img, conf=0.25):
-    print(det["bbox"], det["conf"])
-```
-
-## Директории и артефакты
-- `runs/detect/train4/weights/best.pt` — веса YOLOv8.  
-- `img/` — примеры (`sample*.jpg`) и тестовый набор `img/test/`.  
-- `hik_raws/<YYYY-MM-DD>/parts/` — сохраненные anpr.xml от камер (по времени запроса). Каталог `images/` создается, но сейчас не используется.  
-- `hik_raws/detections.log` — построчный JSON с данными камеры и результатом модели.  
-- `debug_raw_crop.jpg`, `debug_proc_crop.jpg` — последний кроп и его бинаризация.  
-- `debug_no_det/` — исходники, где номер не найден.
-
-## Тесты и отладка
-- Быстрая проверка пайплайна: `python -m modules.anpr img/sample.jpg` или `python tests/test_anpr.py` (при необходимости поправьте путь к картинке).  
-- Детектор: `python tests/test_detect.py`.  
-- OCR отдельно: `python tests/test_ocr_standalone.py`.  
-- Сравнение кастомных OCR-моделей: `python tests/compare_models.py` (использует `img/test` и модели в `models/infer_*`; поправьте пути под свои данные).
-
-## Настройки
-- Другие веса YOLO: `ANPR(yolo_weights="path/to/weights.pt")`.  
-- Порог детекции и препроцессинг правятся в `modules/anpr.py`.  
-- OCR по умолчанию CPU; переключение на GPU — в `modules/ocr.py` (`device="gpu:0"`).  
-- Адрес внешнего сервиса для Hikvision-эвентов — `UPSTREAM_URL` в `api.py`.
