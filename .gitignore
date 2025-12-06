@@ -7,3 +7,4 @@
 /ppocr/
 */test/
 /hik_raws/
+.env

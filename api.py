@@ -1,4 +1,5 @@
 from typing import Any, Dict
+import os
 import pathlib
 import datetime
 import json
@@ -11,6 +12,7 @@ from fastapi import FastAPI, File, UploadFile, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from modules.anpr import ANPR
+from combined_merger import init_merger
 
 app = FastAPI(
     title="Hikvision ANPR Wrapper",
@@ -23,11 +25,31 @@ engine = ANPR()
 
 # URL внешнего сервиса, куда шлём JSON + фото
 UPSTREAM_URL = "https://snowops-anpr-service.onrender.com/api/v1/anpr/events"
+MERGE_WINDOW_SECONDS = int(os.getenv("MERGE_WINDOW_SECONDS", "30"))
+MERGE_TTL_SECONDS = int(os.getenv("MERGE_TTL_SECONDS", "60"))
+ENABLE_SNOW_WORKER = os.getenv("ENABLE_SNOW_WORKER", "false").lower() == "true"
+
+merger = init_merger(
+    upstream_url=UPSTREAM_URL,
+    window_seconds=MERGE_WINDOW_SECONDS,
+    ttl_seconds=MERGE_TTL_SECONDS,
+)
 
 
 @app.get("/health", summary="Health")
 def health() -> Dict[str, str]:
     return {"status": "ok"}
+
+
+@app.on_event("startup")
+async def start_background_workers():
+    if ENABLE_SNOW_WORKER:
+        from snow_worker import start_snow_worker, SNOW_VIDEO_SOURCE_URL
+
+        print(f"[STARTUP] snow worker enabled, source={SNOW_VIDEO_SOURCE_URL}")
+        start_snow_worker(UPSTREAM_URL)
+    else:
+        print("[STARTUP] snow worker disabled (set ENABLE_SNOW_WORKER=true to enable)")
 
 
 @app.post("/anpr", summary="Recognize Plate")
@@ -354,8 +376,8 @@ async def hikvision_isapi(request: Request):
         }
 
         # 5) Отправляем JSON + фото на внешний сервис и получаем результат
-        upstream_result = await send_to_upstream(
-            event_data=event_data,
+        upstream_result = await merger.combine_and_send(
+            anpr_event=event_data,
             detection_bytes=detection_bytes,
             feature_bytes=feature_bytes,
             license_bytes=license_bytes,
@@ -367,6 +389,7 @@ async def hikvision_isapi(request: Request):
             "upstream_sent": upstream_result["sent"],
             "upstream_status": upstream_result["status"],
             "upstream_error": upstream_result["error"],
+            "matched_snow": upstream_result.get("matched_snow"),
         }
 
         log_path = BASE_DIR / "detections.log"
@@ -441,8 +464,8 @@ async def hikvision_isapi(request: Request):
     }
 
     # Отправляем только одну картинку как detection_picture
-    upstream_result = await send_to_upstream(
-        event_data=event_data,
+    upstream_result = await merger.combine_and_send(
+        anpr_event=event_data,
         detection_bytes=jpg_bytes,
         feature_bytes=None,
         license_bytes=None,
@@ -454,6 +477,7 @@ async def hikvision_isapi(request: Request):
         "upstream_status": upstream_result["status"],
         "upstream_error": upstream_result["error"],
         "anpr_bbox": model_bbox,
+        "matched_snow": upstream_result.get("matched_snow"),
     }
 
     log_path = BASE_DIR / "detections.log"
