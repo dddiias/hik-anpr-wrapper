@@ -159,7 +159,21 @@ class EventMerger:
         else:
             combined_event["matched_snow"] = False
 
+        # Логируем номер и формат времени перед отправкой
+        plate_value = combined_event.get("plate", "N/A")
+        event_time_value = combined_event.get("event_time", "N/A")
+        print(f"[MERGER] SENDING EVENT - plate: '{plate_value}' (type: {type(plate_value).__name__})")
+        print(f"[MERGER] SENDING EVENT - event_time: '{event_time_value}' (type: {type(event_time_value).__name__})")
+        print(f"[MERGER] SENDING EVENT - full JSON keys: {list(combined_event.keys())}")
+        
+        # Проверяем обязательные поля
+        required_fields = ["camera_id", "event_time", "plate", "confidence", "direction", "lane", "vehicle"]
+        missing_fields = [f for f in required_fields if f not in combined_event]
+        if missing_fields:
+            print(f"[MERGER] WARNING: missing required fields: {missing_fields}")
+        
         data = {"event": json.dumps(combined_event, ensure_ascii=False)}
+        
         files = []
 
         if detection_bytes:
@@ -205,11 +219,25 @@ class EventMerger:
 
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
-                resp = await client.post(
-                    self.upstream_url,
-                    data=data,
-                    files=files or None,
-                )
+                # Если есть файлы - отправляем multipart/form-data
+                # Если файлов нет - отправляем как JSON (application/json)
+                if files:
+                    print(f"[MERGER] sending multipart request with {len(files)} files")
+                    print(f"[MERGER] multipart data keys: {list(data.keys())}")
+                    resp = await client.post(
+                        self.upstream_url,
+                        data=data,
+                        files=files,
+                    )
+                else:
+                    # Нет файлов - отправляем как JSON
+                    print(f"[MERGER] sending JSON request (no files)")
+                    print(f"[MERGER] JSON payload size: {len(json.dumps(combined_event, ensure_ascii=False))} bytes")
+                    resp = await client.post(
+                        self.upstream_url,
+                        json=combined_event,
+                        headers={"Content-Type": "application/json"},
+                    )
             result["sent"] = resp.is_success
             result["status"] = resp.status_code
             
@@ -230,7 +258,9 @@ class EventMerger:
                 )
             
             if not resp.is_success:
-                result["error"] = resp.text[:400]
+                error_text = resp.text[:400] if resp.text else "No error message"
+                result["error"] = error_text
+                print(f"[MERGER] ERROR from upstream: status={resp.status_code}, error={error_text}")
             print(
                 f"[MERGER] upstream sent={result['sent']} "
                 f"status={result['status']} matched_snow={result['matched_snow']} "

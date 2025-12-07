@@ -349,11 +349,26 @@ async def hikvision_isapi(request: Request):
 
         # === Формируем JSON-событие в простом виде ===
 
-        now_iso = datetime.datetime.now().isoformat()
+        # Используем UTC timezone для RFC3339 формата (требуется Go)
+        now_utc = datetime.datetime.now(datetime.timezone.utc)
+        now_iso = now_utc.isoformat().replace('+00:00', 'Z')  # RFC3339 формат
 
         camera_plate = camera_info.get("plate")
         camera_conf = camera_info.get("confidence")
-        event_time = camera_info.get("date_time") or now_iso
+        
+        # Парсим event_time из камеры или используем текущее время
+        event_time_str = camera_info.get("date_time")
+        if event_time_str:
+            # Пытаемся распарсить время от камеры
+            try:
+                # Если камера отправляет без timezone, добавляем UTC
+                if 'Z' not in event_time_str and '+' not in event_time_str:
+                    event_time_str = event_time_str + 'Z'
+                event_time = event_time_str
+            except Exception:
+                event_time = now_iso
+        else:
+            event_time = now_iso
 
         # основной номер события для поля plate (обязателен для бэкенда)
         main_plate = model_plate or camera_plate
@@ -365,10 +380,14 @@ async def hikvision_isapi(request: Request):
         print(f"[TEST] HARDCODE: replaced plate '{original_plate}' -> '{main_plate}' for whitelist testing")
 
         event_data: Dict[str, Any] = {
-            # контракт бэкенда
+            # контракт бэкенда (обязательные поля)
             "camera_id": "camera-001",  # TODO: подставь реальный ID камеры
-            "event_time": event_time,
+            "event_time": event_time,  # RFC3339 формат с timezone
             "plate": main_plate,
+            "confidence": float(camera_conf) if camera_conf is not None else 0.0,  # обязательное поле
+            "direction": camera_info.get("direction", "unknown"),  # обязательное поле
+            "lane": int(camera_info.get("lane", 0)),  # обязательное поле
+            "vehicle": {},  # обязательное поле (пустой объект если нет данных)
 
             # понятные поля
             "camera_plate": camera_plate,
@@ -385,6 +404,16 @@ async def hikvision_isapi(request: Request):
         }
 
         # 5) Отправляем JSON + фото на внешний сервис и получаем результат
+        # Логируем, какие файлы есть
+        files_info = []
+        if detection_bytes:
+            files_info.append(f"detection({len(detection_bytes)} bytes)")
+        if feature_bytes:
+            files_info.append(f"feature({len(feature_bytes)} bytes)")
+        if license_bytes:
+            files_info.append(f"license({len(license_bytes)} bytes)")
+        print(f"[HIK] files to send: {files_info if files_info else 'NONE'}")
+        
         upstream_result = await merger.combine_and_send(
             anpr_event=event_data,
             detection_bytes=detection_bytes,
@@ -459,7 +488,9 @@ async def hikvision_isapi(request: Request):
     model_ocr_conf = anpr_res.get("ocr_conf")
     model_bbox = anpr_res.get("bbox")
 
-    now_iso = datetime.datetime.now().isoformat()
+    # Используем UTC timezone для RFC3339 формата (требуется Go)
+    now_utc = datetime.datetime.now(datetime.timezone.utc)
+    now_iso = now_utc.isoformat().replace('+00:00', 'Z')  # RFC3339 формат
 
     # тут камеры нет, только модель
     main_plate = model_plate
@@ -471,9 +502,15 @@ async def hikvision_isapi(request: Request):
     print(f"[TEST] HARDCODE: replaced plate '{original_plate}' -> '{main_plate}' for whitelist testing")
 
     event_data: Dict[str, Any] = {
+        # контракт бэкенда (обязательные поля)
         "camera_id": "camera-001",
-        "event_time": now_iso,
+        "event_time": now_iso,  # RFC3339 формат с timezone
         "plate": main_plate,
+        "confidence": float(model_ocr_conf) if model_ocr_conf is not None else 0.0,  # обязательное поле
+        "direction": "unknown",  # обязательное поле
+        "lane": 0,  # обязательное поле
+        "vehicle": {},  # обязательное поле (пустой объект если нет данных)
+        
         "camera_plate": None,
         "camera_confidence": None,
         "model_plate": model_plate,
@@ -482,7 +519,7 @@ async def hikvision_isapi(request: Request):
         
         # TODO: ВРЕМЕННО - оригинальный номер для отладки
         "original_plate_test": original_plate,
-        
+
         "timestamp": now_iso,
     }
 
