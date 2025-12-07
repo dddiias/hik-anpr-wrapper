@@ -96,6 +96,27 @@ class EventMerger:
         del self._snow_events[best_idx]
         return match
 
+    def restore_snow_event(self, snow_event: SnowEvent) -> None:
+        """
+        Возвращает снеговое событие обратно в очередь.
+        Используется когда событие номеров не было сохранено (машины нет в базе).
+        """
+        with self._lock:
+            # Вставляем событие обратно в очередь, сохраняя порядок по времени
+            inserted = False
+            for idx, existing_event in enumerate(self._snow_events):
+                if snow_event.event_time <= existing_event.event_time:
+                    self._snow_events.insert(idx, snow_event)
+                    inserted = True
+                    break
+            if not inserted:
+                # Если событие самое новое, добавляем в конец
+                self._snow_events.append(snow_event)
+        print(
+            f"[MERGER] restored snow event at {snow_event.event_time.isoformat()}, "
+            f"queue size={len(self._snow_events)}"
+        )
+
     async def combine_and_send(
         self,
         anpr_event: Dict[str, Any],
@@ -164,6 +185,18 @@ class EventMerger:
             "error": None,
             "matched_snow": bool(snow_event),
         }
+        
+        # Добавляем данные снега в результат для логирования
+        if snow_event:
+            result["snow_data"] = {
+                "snow_event_time": snow_event.event_time.isoformat(),
+                "snow_camera_id": snow_event.payload.get("camera_id"),
+                "snow_volume_percentage": snow_event.payload.get("snow_volume_percentage"),
+                "snow_volume_confidence": snow_event.payload.get("snow_volume_confidence"),
+                "snow_direction_ai": snow_event.payload.get("snow_direction_ai"),
+            }
+            if "snow_gemini_raw" in snow_event.payload:
+                result["snow_data"]["snow_gemini_raw"] = snow_event.payload["snow_gemini_raw"]
 
         if not self.upstream_url:
             result["error"] = "UPSTREAM_URL is empty"
@@ -179,15 +212,37 @@ class EventMerger:
                 )
             result["sent"] = resp.is_success
             result["status"] = resp.status_code
+            
+            # Парсим ответ от anpr-service чтобы узнать, была ли машина найдена
+            vehicle_exists = None
+            if resp.is_success and resp.status_code == 201:
+                try:
+                    response_json = resp.json()
+                    vehicle_exists = response_json.get("vehicle_exists", None)
+                except Exception:
+                    pass  # Не критично, если не удалось распарсить
+            
+            # Если машины нет в базе (vehicle_exists = false), возвращаем снеговое событие обратно в очередь
+            if snow_event and vehicle_exists is False:
+                self.restore_snow_event(snow_event)
+                print(
+                    f"[MERGER] vehicle not found in database, restored snow event to queue"
+                )
+            
             if not resp.is_success:
                 result["error"] = resp.text[:400]
             print(
                 f"[MERGER] upstream sent={result['sent']} "
-                f"status={result['status']} matched_snow={result['matched_snow']}"
+                f"status={result['status']} matched_snow={result['matched_snow']} "
+                f"vehicle_exists={vehicle_exists}"
             )
         except Exception as e:
             result["error"] = str(e)
             print(f"[MERGER] error while sending event: {e}")
+            # При ошибке тоже возвращаем событие снега обратно, чтобы не потерять данные
+            if snow_event:
+                self.restore_snow_event(snow_event)
+                print(f"[MERGER] error occurred, restored snow event to queue")
 
         return result
 

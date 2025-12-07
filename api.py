@@ -358,6 +358,12 @@ async def hikvision_isapi(request: Request):
         # основной номер события для поля plate (обязателен для бэкенда)
         main_plate = model_plate or camera_plate
 
+        # TODO: ВРЕМЕННЫЙ ХАРДКОД ДЛЯ ТЕСТИРОВАНИЯ - заменить на whitelist номер
+        # Удалить после тестирования!
+        original_plate = main_plate  # Сохраняем оригинальный номер для логов
+        main_plate = "747AO"
+        print(f"[TEST] HARDCODE: replaced plate '{original_plate}' -> '{main_plate}' for whitelist testing")
+
         event_data: Dict[str, Any] = {
             # контракт бэкенда
             "camera_id": "camera-001",  # TODO: подставь реальный ID камеры
@@ -370,6 +376,9 @@ async def hikvision_isapi(request: Request):
             "model_plate": model_plate,
             "model_det_conf": model_det_conf,
             "model_ocr_conf": model_ocr_conf,
+            
+            # TODO: ВРЕМЕННО - оригинальный номер для отладки
+            "original_plate_test": original_plate,
 
             # доп. служебное время
             "timestamp": now_iso,
@@ -383,7 +392,7 @@ async def hikvision_isapi(request: Request):
             license_bytes=license_bytes,
         )
 
-        # 6) Логируем в detections.log (включая статус отправки)
+        # 6) Логируем в detections.log (включая статус отправки и данные снега)
         log_event = {
             **event_data,
             "upstream_sent": upstream_result["sent"],
@@ -391,6 +400,10 @@ async def hikvision_isapi(request: Request):
             "upstream_error": upstream_result["error"],
             "matched_snow": upstream_result.get("matched_snow"),
         }
+        
+        # Добавляем данные снега в лог, если они есть
+        if "snow_data" in upstream_result:
+            log_event.update(upstream_result["snow_data"])
 
         log_path = BASE_DIR / "detections.log"
         with log_path.open("a", encoding="utf-8") as f:
@@ -451,6 +464,12 @@ async def hikvision_isapi(request: Request):
     # тут камеры нет, только модель
     main_plate = model_plate
 
+    # TODO: ВРЕМЕННЫЙ ХАРДКОД ДЛЯ ТЕСТИРОВАНИЯ - заменить на whitelist номер
+    # Удалить после тестирования!
+    original_plate = main_plate  # Сохраняем оригинальный номер для логов
+    main_plate = "747AO"
+    print(f"[TEST] HARDCODE: replaced plate '{original_plate}' -> '{main_plate}' for whitelist testing")
+
     event_data: Dict[str, Any] = {
         "camera_id": "camera-001",
         "event_time": now_iso,
@@ -460,6 +479,10 @@ async def hikvision_isapi(request: Request):
         "model_plate": model_plate,
         "model_det_conf": model_det_conf,
         "model_ocr_conf": model_ocr_conf,
+        
+        # TODO: ВРЕМЕННО - оригинальный номер для отладки
+        "original_plate_test": original_plate,
+        
         "timestamp": now_iso,
     }
 
@@ -479,6 +502,10 @@ async def hikvision_isapi(request: Request):
         "anpr_bbox": model_bbox,
         "matched_snow": upstream_result.get("matched_snow"),
     }
+    
+    # Добавляем данные снега в лог, если они есть
+    if "snow_data" in upstream_result:
+        log_event.update(upstream_result["snow_data"])
 
     log_path = BASE_DIR / "detections.log"
     with log_path.open("a", encoding="utf-8") as f:
