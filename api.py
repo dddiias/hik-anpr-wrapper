@@ -373,6 +373,68 @@ async def hikvision_isapi(request: Request):
         # основной номер события для поля plate (обязателен для бэкенда)
         main_plate = model_plate or camera_plate
 
+        # Проверка: есть ли anpr.xml от камеры
+        has_anpr_xml = camera_xml_path is not None
+        
+        # Проверка: есть ли нормальный номер (не None и не пустая строка)
+        has_valid_plate = main_plate and main_plate.strip() and main_plate != "unknown"
+        
+        # Проверка уверенности: модель должна иметь достаточную уверенность
+        # det_conf >= 0.3 и ocr_conf >= 0.5, или camera_conf >= 0.5
+        has_valid_confidence = False
+        if model_det_conf is not None and model_ocr_conf is not None:
+            has_valid_confidence = model_det_conf >= 0.3 and model_ocr_conf >= 0.5
+        elif camera_conf is not None:
+            has_valid_confidence = camera_conf >= 0.5
+        
+        # Если нет anpr.xml И (нет нормального номера ИЛИ нет достаточной уверенности) - не отправляем событие
+        # Это предотвращает отправку событий с плохо распознанными номерами
+        if not has_anpr_xml and (not has_valid_plate or not has_valid_confidence):
+            print(f"[HIK] SKIPPING EVENT: no anpr.xml, plate='{main_plate}', det_conf={model_det_conf}, ocr_conf={model_ocr_conf}, camera_conf={camera_conf}")
+            # Логируем пропущенное событие
+            log_event = {
+                "timestamp": now_iso,
+                "kind": "skipped_no_valid_data",
+                "has_anpr_xml": has_anpr_xml,
+                "plate": main_plate,
+                "model_plate": model_plate,
+                "camera_plate": camera_plate,
+                "model_det_conf": model_det_conf,
+                "model_ocr_conf": model_ocr_conf,
+                "camera_conf": camera_conf,
+                "upstream_sent": False,
+                "upstream_status": None,
+                "upstream_error": "skipped: no valid plate and low confidence",
+            }
+            log_path = BASE_DIR / "detections.log"
+            with log_path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(log_event, ensure_ascii=False) + "\n")
+            return JSONResponse({"status": "ok"})
+        
+        # Если есть anpr.xml, но (нет нормального номера ИЛИ низкая уверенность) - не отправляем
+        # Это предотвращает отправку событий с плохо распознанными номерами даже если есть anpr.xml
+        if has_anpr_xml and (not has_valid_plate or not has_valid_confidence):
+            print(f"[HIK] SKIPPING EVENT: anpr.xml exists but plate='{main_plate}' is invalid and confidence too low (det_conf={model_det_conf}, ocr_conf={model_ocr_conf}, camera_conf={camera_conf})")
+            # Логируем пропущенное событие
+            log_event = {
+                "timestamp": now_iso,
+                "kind": "skipped_low_confidence",
+                "has_anpr_xml": has_anpr_xml,
+                "plate": main_plate,
+                "model_plate": model_plate,
+                "camera_plate": camera_plate,
+                "model_det_conf": model_det_conf,
+                "model_ocr_conf": model_ocr_conf,
+                "camera_conf": camera_conf,
+                "upstream_sent": False,
+                "upstream_status": None,
+                "upstream_error": "skipped: invalid plate and low confidence",
+            }
+            log_path = BASE_DIR / "detections.log"
+            with log_path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(log_event, ensure_ascii=False) + "\n")
+            return JSONResponse({"status": "ok"})
+
         # TODO: ВРЕМЕННЫЙ ХАРДКОД ДЛЯ ТЕСТИРОВАНИЯ - заменить на whitelist номер
         # Удалить после тестирования!
         original_plate = main_plate  # Сохраняем оригинальный номер для логов
@@ -395,6 +457,7 @@ async def hikvision_isapi(request: Request):
             "model_plate": model_plate,
             "model_det_conf": model_det_conf,
             "model_ocr_conf": model_ocr_conf,
+            "xml_event_type": camera_info.get("event_type"),  # тип события из anpr.xml
             
             # TODO: ВРЕМЕННО - оригинальный номер для отладки
             "original_plate_test": original_plate,
@@ -494,6 +557,35 @@ async def hikvision_isapi(request: Request):
 
     # тут камеры нет, только модель
     main_plate = model_plate
+
+    # Проверка: есть ли нормальный номер (не None и не пустая строка)
+    has_valid_plate = main_plate and main_plate.strip() and main_plate != "unknown"
+    
+    # Проверка уверенности: модель должна иметь достаточную уверенность
+    # det_conf >= 0.3 и ocr_conf >= 0.5
+    has_valid_confidence = False
+    if model_det_conf is not None and model_ocr_conf is not None:
+        has_valid_confidence = model_det_conf >= 0.3 and model_ocr_conf >= 0.5
+    
+    # Если нет нормального номера ИЛИ нет достаточной уверенности - не отправляем событие
+    # Это предотвращает отправку событий с плохо распознанными номерами
+    if not has_valid_plate or not has_valid_confidence:
+        print(f"[HIK] SKIPPING EVENT (fallback): plate='{main_plate}', det_conf={model_det_conf}, ocr_conf={model_ocr_conf}")
+        # Логируем пропущенное событие
+        log_event = {
+            "timestamp": now_iso,
+            "kind": "skipped_fallback_no_valid_data",
+            "plate": main_plate,
+            "model_det_conf": model_det_conf,
+            "model_ocr_conf": model_ocr_conf,
+            "upstream_sent": False,
+            "upstream_status": None,
+            "upstream_error": "skipped: no valid plate and low confidence",
+        }
+        log_path = BASE_DIR / "detections.log"
+        with log_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(log_event, ensure_ascii=False) + "\n")
+        return JSONResponse({"status": "ok"})
 
     # TODO: ВРЕМЕННЫЙ ХАРДКОД ДЛЯ ТЕСТИРОВАНИЯ - заменить на whitelist номер
     # Удалить после тестирования!

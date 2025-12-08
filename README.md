@@ -62,7 +62,9 @@ Multipart `POST {UPSTREAM_URL}` with:
   - `camera_id` (plate camera id)
   - `event_time` (from camera XML or now, ISO8601)
   - `plate`, `camera_plate`, `camera_confidence`, `model_plate`, `model_det_conf`, `model_ocr_conf`, `timestamp`
-  - If matched snow: `snow_event_time`, `snow_camera_id`, `snow_volume_percentage`, `snow_volume_confidence`, `snow_direction_ai`, `snow_gemini_raw`, `matched_snow=true`
+  - If matched snow: `snow_volume_percentage`, `snow_volume_confidence`, `snow_gemini_raw`, `matched_snow=true`
+  - Note: `snow_volume_m3` вычисляется на стороне Go сервиса: `(snow_volume_percentage / 100) * body_volume_m3`
+  - Note: для времени снежного события используется `event_time`, для камеры - `camera_id` (не дублируются)
   - If no snow match yet: `matched_snow=false`
 - Field `photos` (one or several):
   - `detectionPicture.jpg` (ANPR frame)

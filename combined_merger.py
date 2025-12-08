@@ -11,19 +11,33 @@ import httpx
 def _parse_iso_dt(value: str | None) -> Optional[datetime]:
     """
     Parse ISO8601 datetime string into aware UTC datetime.
-    Accepts trailing "Z".
+    Accepts trailing "Z" and timezone offsets like "+06:00".
     """
     if not value:
         return None
     try:
-        cleaned = value
+        cleaned = str(value).strip()
+        
+        # Проверяем, нет ли дублирования timezone (например, +00:00Z или +00:00+00:00)
+        if cleaned.endswith("+00:00Z") or cleaned.endswith("-00:00Z"):
+            # Убираем дублирование: оставляем только Z
+            cleaned = cleaned[:-6] + "Z"
+        elif "+00:00+00:00" in cleaned or "-00:00+00:00" in cleaned:
+            # Убираем дублирование timezone
+            cleaned = cleaned.replace("+00:00+00:00", "+00:00").replace("-00:00+00:00", "+00:00")
+        
+        # Если заканчивается на Z, заменяем на +00:00
         if cleaned.endswith("Z"):
             cleaned = cleaned[:-1] + "+00:00"
+        # Парсим ISO формат (поддерживает +06:00, -05:00 и т.д.)
         dt = datetime.fromisoformat(cleaned)
+        # Если нет timezone, добавляем UTC
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
+        # Конвертируем в UTC
         return dt.astimezone(timezone.utc)
-    except Exception:
+    except Exception as e:
+        print(f"[MERGER] ERROR parsing datetime '{value}': {e}")
         return None
 
 
@@ -78,22 +92,33 @@ class EventMerger:
         best_idx = None
         best_delta = None
 
+        print(f"[MERGER] DEBUG: searching match for anpr_time={anpr_time.isoformat()}, queue_size={len(self._snow_events)}, window={self.window.total_seconds()}s")
+        
         for idx, snow_event in enumerate(self._snow_events):
             delta = anpr_time - snow_event.event_time
+            delta_seconds = delta.total_seconds()
+            print(f"[MERGER] DEBUG: snow[{idx}] time={snow_event.event_time.isoformat()}, delta={delta_seconds:.1f}s")
+            
             if delta < timedelta(0):
                 # snow should happen before plate; skip future events
+                print(f"[MERGER] DEBUG: snow[{idx}] is in future, skipping")
                 continue
             if delta <= self.window:
                 if best_delta is None or delta < best_delta:
                     best_delta = delta
                     best_idx = idx
+                    print(f"[MERGER] DEBUG: snow[{idx}] is candidate, delta={delta_seconds:.1f}s")
+            else:
+                print(f"[MERGER] DEBUG: snow[{idx}] delta={delta_seconds:.1f}s exceeds window={self.window.total_seconds()}s")
 
         if best_idx is None:
+            print(f"[MERGER] DEBUG: no match found")
             return None
 
         # remove matched event
         match = self._snow_events[best_idx]
         del self._snow_events[best_idx]
+        print(f"[MERGER] DEBUG: matched snow[{best_idx}], delta={best_delta.total_seconds():.1f}s")
         return match
 
     def restore_snow_event(self, snow_event: SnowEvent) -> None:
@@ -129,10 +154,10 @@ class EventMerger:
         and send a single multipart request upstream.
         """
         now = datetime.now(tz=timezone.utc)
-        anpr_time = (
-            _parse_iso_dt(str(anpr_event.get("event_time")))
-            or now
-        )
+        anpr_time_str = str(anpr_event.get("event_time", ""))
+        anpr_time = _parse_iso_dt(anpr_time_str) or now
+        
+        print(f"[MERGER] DEBUG: anpr_event_time_str='{anpr_time_str}', parsed={anpr_time.isoformat()}, now={now.isoformat()}")
 
         with self._lock:
             self._cleanup(now)
@@ -140,24 +165,30 @@ class EventMerger:
 
         combined_event = dict(anpr_event)
         if snow_event:
+            # Используем event_time и camera_id из основного события (не дублируем)
+            # snow_volume_m3 будет вычислен на стороне Go сервиса на основе процента и body_volume_m3
             combined_event.update(
                 {
-                    "snow_event_time": snow_event.event_time.isoformat(),
-                    "snow_camera_id": snow_event.payload.get("camera_id"),
                     "snow_volume_percentage": snow_event.payload.get(
-                        "snow_volume_percentage"
+                        "snow_volume_percentage", 0.0
                     ),
                     "snow_volume_confidence": snow_event.payload.get(
-                        "snow_volume_confidence"
+                        "snow_volume_confidence", 0.0
                     ),
-                    "snow_direction_ai": snow_event.payload.get("snow_direction_ai"),
                     "matched_snow": True,
                 }
             )
             if "snow_gemini_raw" in snow_event.payload:
                 combined_event["snow_gemini_raw"] = snow_event.payload["snow_gemini_raw"]
         else:
-            combined_event["matched_snow"] = False
+            # Всегда заполняем поля о снеге, даже если снег не найден
+            combined_event.update(
+                {
+                    "snow_volume_percentage": 0.0,
+                    "snow_volume_confidence": 0.0,
+                    "matched_snow": False,
+                }
+            )
 
         # Логируем номер и формат времени перед отправкой
         plate_value = combined_event.get("plate", "N/A")
@@ -203,11 +234,8 @@ class EventMerger:
         # Добавляем данные снега в результат для логирования
         if snow_event:
             result["snow_data"] = {
-                "snow_event_time": snow_event.event_time.isoformat(),
-                "snow_camera_id": snow_event.payload.get("camera_id"),
                 "snow_volume_percentage": snow_event.payload.get("snow_volume_percentage"),
                 "snow_volume_confidence": snow_event.payload.get("snow_volume_confidence"),
-                "snow_direction_ai": snow_event.payload.get("snow_direction_ai"),
             }
             if "snow_gemini_raw" in snow_event.payload:
                 result["snow_data"]["snow_gemini_raw"] = snow_event.payload["snow_gemini_raw"]
