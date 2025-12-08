@@ -83,18 +83,15 @@ def _is_moving_left_to_right(current_center_x: int, last_center_x: Optional[int]
     return (current_center_x - last_center_x) > MIN_DIRECTION_DELTA
 
 
-def _save_frame(frame: np.ndarray):
+def _encode_frame_to_jpeg(frame: np.ndarray) -> Tuple[bytes, datetime]:
     """
-    Сохранить кадр в snapshots/YYYY-MM-DD/HH-MM-SS.jpg.
+    Превратить кадр в JPEG-байты без записи на диск.
     """
-    now = datetime.now(tz=timezone.utc)
-    date_dir = os.path.join(SNAPSHOT_BASE_DIR, now.strftime("%Y-%m-%d"))
-    os.makedirs(date_dir, exist_ok=True)
-
-    filename = now.strftime("%H-%M-%S") + ".jpg"
-    path = os.path.join(date_dir, filename)
-    cv2.imwrite(path, frame)
-    return path, now
+    ts = datetime.now(tz=timezone.utc)
+    ok, buf = cv2.imencode(".jpg", frame)
+    if not ok:
+        raise RuntimeError("cannot encode frame to JPEG")
+    return buf.tobytes(), ts
 
 
 def _get_gemini_client() -> genai.Client:
@@ -106,77 +103,79 @@ def _get_gemini_client() -> genai.Client:
     return _gemini_client
 
 
-def _analyze_snow_gemini(image_path: str, bbox: Optional[Tuple[int, int, int, int]] = None) -> dict:
+def _analyze_snow_gemini(image: Image.Image, bbox: Optional[Tuple[int, int, int, int]] = None) -> dict:
     """
-    Отправка кадра в Gemini, ожидаем JSON с percentage/confidence.
-    Если передан bbox, обрезаем изображение до области грузовика.
+    Send in-memory PIL image to Gemini and expect JSON with percentage/confidence.
+    Nothing is written to disk.
     """
-    print(f"[GEMINI] STARTING ANALYSIS: image_path={image_path}, bbox={bbox}")
+    print(f"[GEMINI] STARTING ANALYSIS: bbox={bbox}")
     try:
-        # Проверяем наличие API ключа
         if not GEMINI_API_KEY:
             error_msg = "GEMINI_API_KEY is not set"
             print(f"[GEMINI] ERROR: {error_msg}")
             return {"error": error_msg}
-        
-        print(f"[GEMINI] Getting client...")
+
         client = _get_gemini_client()
-        print(f"[GEMINI] Opening image: {image_path}")
-        image = Image.open(image_path)
-        print(f"[GEMINI] Image opened: size={image.size}, mode={image.mode}")
-        
-        # Обрезаем изображение до области грузовика, если bbox передан
+        work_image = image.convert("RGB")
+
         if bbox:
             x1, y1, x2, y2 = bbox
-            # Добавляем небольшой отступ для контекста
             padding = 20
             x1 = max(0, x1 - padding)
             y1 = max(0, y1 - padding)
-            x2 = min(image.width, x2 + padding)
-            y2 = min(image.height, y2 + padding)
-            image = image.crop((x1, y1, x2, y2))
-            print(f"[GEMINI] cropped image to bbox: ({x1}, {y1}, {x2}, {y2}), cropped size: {image.width}x{image.height}")
-        
+            x2 = min(work_image.width, x2 + padding)
+            y2 = min(work_image.height, y2 + padding)
+            work_image = work_image.crop((x1, y1, x2, y2))
+            print(
+                f"[GEMINI] cropped image to bbox: ({x1}, {y1}, {x2}, {y2}), "
+                f"cropped size: {work_image.width}x{work_image.height}"
+            )
+
         prompt = (
-            "Ты видишь изображение ГРУЗОВОГО ОТСЕКА (кузова) грузовика.\n"
-            "ВАЖНО: анализируй ТОЛЬКО внутреннее пространство открытого кузова грузовика, где может быть снег.\n"
-            "ИГНОРИРУЙ: снег на дороге, на крыше кабины, на других объектах, на земле.\n"
-            "Оцени ТОЛЬКО заполненность снегом ВНУТРИ кузова грузовика.\n\n"
-            "Верни ТОЛЬКО JSON с полями:\n"
-            "- percentage (0.0-1.0, где 0.0 = кузов полностью пустой, 1.0 = кузов полностью заполнен снегом)\n"
-            "- confidence (0.0-1.0, уверенность в оценке)\n\n"
-            "Если на изображении нет открытого кузова грузовика или это не грузовик - верни percentage=0.0, confidence=0.0\n\n"
-            "Пример:\n"
-            "{\n"
-            '  "percentage": 0.42,\n'
-            '  "confidence": 0.9\n'
-            "}\n"
+            "You see the cargo bed of a truck.
+"
+            "Focus ONLY on snow fill inside the open bed. Ignore road/roof/background.
+"
+            "Return JSON with fields:
+"
+            "- percentage: 0.0-1.0 or 0-100 for how full with snow
+"
+            "- confidence: 0.0-1.0
+
+"
+            "If no open truck bed is visible, set percentage=0 and confidence=0.
+
+"
+            "Example:
+"
+            "{
+"
+            '  "percentage": 0.42,
+'
+            '  "confidence": 0.9
+'
+            "}
+"
         )
         print(f"[GEMINI] Sending request to Gemini API (model={GEMINI_MODEL})...")
-        print(f"[GEMINI] Prompt length: {len(prompt)} chars")
-        
+
         response = client.models.generate_content(
             model=GEMINI_MODEL,
-            contents=[image, prompt],
+            contents=[work_image, prompt],
         )
-        
-        print(f"[GEMINI] Response received, checking text...")
+
         text = (response.text or "").strip()
-        
+
         if not text:
             error_msg = "Empty response from Gemini"
             print(f"[GEMINI] ERROR: {error_msg}")
             return {"error": error_msg}
-        
-        print(f"[GEMINI] raw response (first 500 chars): {text[:500]}")
-        print(f"[GEMINI] raw response length: {len(text)} chars")
-        
+
         if text.startswith("```"):
             text = text.strip("`")
             if text.lower().startswith("json"):
                 text = text[4:].strip()
-            print(f"[GEMINI] Cleaned markdown, new text: {text[:200]}")
-        
+
         try:
             data = json.loads(text)
             print(f"[GEMINI] SUCCESS: parsed JSON: {data}")
@@ -184,7 +183,6 @@ def _analyze_snow_gemini(image_path: str, bbox: Optional[Tuple[int, int, int, in
         except json.JSONDecodeError as e:
             error_msg = f"JSON parse error: {str(e)}"
             print(f"[GEMINI] ERROR: {error_msg}")
-            print(f"[GEMINI] Raw text that failed to parse: {text[:500]}")
             return {"raw": text, "error": error_msg, "percentage": 0.0, "confidence": 0.0}
     except Exception as e:
         error_msg = f"Exception in Gemini analysis: {str(e)}"
@@ -192,18 +190,6 @@ def _analyze_snow_gemini(image_path: str, bbox: Optional[Tuple[int, int, int, in
         import traceback
         traceback.print_exc()
         return {"error": error_msg, "percentage": 0.0, "confidence": 0.0}
-
-
-def _save_analysis_json(image_path: str, timestamp: datetime, gemini_result: dict) -> str:
-    json_path = image_path.rsplit(".", 1)[0] + ".json"
-    payload = {
-        "timestamp": timestamp.isoformat(),
-        "image_path": image_path,
-        "gemini": gemini_result,
-    }
-    with open(json_path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
-    return json_path
 
 
 def _extract_gemini_fields(gemini_result: dict):
@@ -375,27 +361,28 @@ def _snow_loop(upstream_url: str):
             # 2. Движется слева направо (подтверждено на втором кадре)
             # 3. Еще не отправлено событие для этого грузовика
             if in_zone and moving_right and not event_sent_for_current_truck:
-                print(f"[SNOW] ===== SAVING SNAPSHOT AND ANALYZING ======")
-                print(f"[SNOW] Truck in zone, moving right, saving frame and sending to Gemini...")
-                ts = datetime.now(tz=timezone.utc)
-                image_path, ts_saved = _save_frame(raw_frame)
-                print(f"[SNOW] Snapshot saved: {image_path}")
+                print(f"[SNOW] ===== ENCODING SNAPSHOT AND ANALYZING (IN-MEMORY) ======")
+                try:
+                    photo_bytes, ts_saved = _encode_frame_to_jpeg(raw_frame)
+                except Exception as e:
+                    print(f"[SNOW] cannot encode frame to JPEG: {e}")
+                    photo_bytes = None
+                    ts_saved = datetime.now(tz=timezone.utc)
 
-                # Передаем bbox для обрезки изображения до области грузовика
+                # Pass bbox so Gemini focuses on the truck area
                 print(f"[SNOW] Calling Gemini API for snow analysis...")
-                gemini_result = _analyze_snow_gemini(image_path, bbox)
+                pil_image = Image.fromarray(cv2.cvtColor(raw_frame, cv2.COLOR_BGR2RGB))
+                gemini_result = _analyze_snow_gemini(pil_image, bbox)
                 print(f"[SNOW] Gemini analysis completed, result: {gemini_result}")
-                
-                _save_analysis_json(image_path, ts_saved, gemini_result)
 
                 percentage, confidence, _ = _extract_gemini_fields(gemini_result)
                 
-                # Логируем результат парсинга
+                # Safety guard: default to zeros if Gemini returned nothing
                 print(f"[SNOW] ===== GEMINI RESULT ======")
                 print(f"[SNOW] percentage={percentage}, confidence={confidence}")
                 print(f"[SNOW] gemini_result keys: {list(gemini_result.keys()) if isinstance(gemini_result, dict) else 'not a dict'}")
                 
-                # Если процент не получен, устанавливаем 0
+                # If percentage or confidence is missing, zero them out
                 if percentage is None:
                     print(f"[SNOW] WARNING: percentage is None, setting to 0, gemini_result={gemini_result}")
                     percentage = 0
@@ -403,16 +390,16 @@ def _snow_loop(upstream_url: str):
                     print(f"[SNOW] WARNING: confidence is None, setting to 0.0")
                     confidence = 0.0
 
-                # Форматируем время в RFC3339 (ISO8601 с Z в конце, но без дублирования timezone)
+                # Format timestamp as RFC3339 (ISO8601) with Z suffix
                 event_time_iso = ts_saved.replace(microsecond=0).isoformat()
-                # Если уже есть timezone (+00:00), заменяем на Z
+                # If timezone is +00:00, convert to Z
                 if event_time_iso.endswith("+00:00"):
                     event_time_iso = event_time_iso[:-6] + "Z"
                 elif "+" in event_time_iso or "-" in event_time_iso[-6:]:
-                    # Если есть другой timezone, оставляем как есть
+                    # If other timezone exists, keep as-is
                     pass
                 else:
-                    # Если нет timezone, добавляем Z
+                    # If no timezone, append Z
                     event_time_iso += "Z"
                 
                 payload = {
@@ -423,13 +410,6 @@ def _snow_loop(upstream_url: str):
                     "snow_gemini_raw": gemini_result,
                 }
                 print(f"[SNOW] payload: {payload}")
-
-                try:
-                    with open(image_path, "rb") as f:
-                        photo_bytes = f.read()
-                except Exception as e:
-                    print(f"[SNOW] cannot read snapshot {image_path}: {e}")
-                    photo_bytes = None
 
                 merger.add_snow_event(payload, photo_bytes)
                 print(f"[SNOW] snow event added to queue, queue_size should increase")
