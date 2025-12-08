@@ -24,7 +24,10 @@ app = FastAPI(
 engine = ANPR()
 
 # URL внешнего сервиса, куда шлём JSON + фото
-UPSTREAM_URL = "https://snowops-anpr-service.onrender.com/api/v1/anpr/events"
+UPSTREAM_URL = os.getenv(
+    "UPSTREAM_URL", "https://snowops-anpr-service.onrender.com/api/v1/anpr/events"
+)
+PLATE_CAMERA_ID = os.getenv("PLATE_CAMERA_ID", "camera-001")
 MERGE_WINDOW_SECONDS = int(os.getenv("MERGE_WINDOW_SECONDS", "30"))
 MERGE_TTL_SECONDS = int(os.getenv("MERGE_TTL_SECONDS", "60"))
 ENABLE_SNOW_WORKER = os.getenv("ENABLE_SNOW_WORKER", "false").lower() == "true"
@@ -435,15 +438,15 @@ async def hikvision_isapi(request: Request):
                 f.write(json.dumps(log_event, ensure_ascii=False) + "\n")
             return JSONResponse({"status": "ok"})
 
-        # TODO: ВРЕМЕННЫЙ ХАРДКОД ДЛЯ ТЕСТИРОВАНИЯ - заменить на whitelist номер
-        # Удалить после тестирования!
-        original_plate = main_plate  # Сохраняем оригинальный номер для логов
-        main_plate = "747AO"
-        print(f"[TEST] HARDCODE: replaced plate '{original_plate}' -> '{main_plate}' for whitelist testing")
+        # Используем нормальный номер, а хардкодим только если и камера, и модель не дали валидное значение
+        original_plate = main_plate
+        if not (main_plate and main_plate.strip() and main_plate != "unknown"):
+            main_plate = "747AO"
+            print(f"[TEST] fallback plate applied: '{original_plate}' -> '{main_plate}'")
 
         event_data: Dict[str, Any] = {
             # контракт бэкенда (обязательные поля)
-            "camera_id": "camera-001",  # TODO: подставь реальный ID камеры
+            "camera_id": PLATE_CAMERA_ID,  # можно сконфигурировать через env
             "event_time": event_time,  # RFC3339 формат с timezone
             "plate": main_plate,
             "confidence": float(camera_conf) if camera_conf is not None else 0.0,  # обязательное поле
@@ -587,15 +590,15 @@ async def hikvision_isapi(request: Request):
             f.write(json.dumps(log_event, ensure_ascii=False) + "\n")
         return JSONResponse({"status": "ok"})
 
-    # TODO: ВРЕМЕННЫЙ ХАРДКОД ДЛЯ ТЕСТИРОВАНИЯ - заменить на whitelist номер
-    # Удалить после тестирования!
+    # Используем нормальный номер, а хардкодим только если модель ничего не дала
     original_plate = main_plate  # Сохраняем оригинальный номер для логов
-    main_plate = "747AO"
-    print(f"[TEST] HARDCODE: replaced plate '{original_plate}' -> '{main_plate}' for whitelist testing")
+    if not (main_plate and main_plate.strip() and main_plate != "unknown"):
+        main_plate = "747AO"
+        print(f"[TEST] fallback plate applied: '{original_plate}' -> '{main_plate}'")
 
     event_data: Dict[str, Any] = {
         # контракт бэкенда (обязательные поля)
-        "camera_id": "camera-001",
+        "camera_id": PLATE_CAMERA_ID,
         "event_time": now_iso,  # RFC3339 формат с timezone
         "plate": main_plate,
         "confidence": float(model_ocr_conf) if model_ocr_conf is not None else 0.0,  # обязательное поле

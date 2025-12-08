@@ -1,81 +1,90 @@
-# Unified ANPR + Snow Service
+# Unified ANPR + Snow Service (RU)
 
-One service that:
-- Accepts Hikvision ANPR webhooks (FastAPI) and extracts plate data (YOLOv8 + PaddleOCR).
-- Continuously watches a snow RTSP camera, detects trucks (YOLOv8), estimates snow volume via Gemini, and buffers those events.
-- Merges the latest snow event with the next plate event (snow -> plate order) and sends a single multipart request to the upstream endpoint with full JSON + all photos.
+Сервис объединяет события двух камер: номерной (Hikvision ANPR) и снеговой (RTSP). Поток такой: снеговая камера кладёт кадры в память, при приходе ANPR вебхука ищется предыдущее снеговое событие в окне, вызывается Gemini для оценки заполненности кузова и отправляется единый multipart на внешний сервис.
 
-## Components
-- `api.py`: FastAPI app with endpoints `GET /health`, `POST /anpr`, `POST /api/v1/anpr/hikvision`. On startup can launch the snow worker.
-- `snow_worker.py`: Background thread for the snow camera (RTSP), truck detection, Gemini analysis, snapshot saving, and publishing snow events to the merger.
-- `combined_merger.py`: In-memory buffer (TTL + window) to match snow events with plate events and send one multipart to `UPSTREAM_URL`.
-- `modules/anpr.py`: Plate detection/OCR pipeline.
+## Архитектура и потоки
+- `api.py` (FastAPI): эндпоинты `GET /health`, `POST /anpr`, `POST /api/v1/anpr/hikvision`. Загружает модели ANPR, по старту может включить снежный воркер.
+- `snow_worker.py`: фон, читает RTSP, детектит грузовики (YOLO), при движении в зоне сохраняет кадр в памяти и кладёт в очередь мерджера (без диска, без Gemini).
+- `combined_merger.py`: хранит снеговые события в памяти (TTL + окно), при ANPR событии берёт ближайшее предыдущее снеговое, только тогда вызывает Gemini (если есть ключ) и шлёт единый multipart на `UPSTREAM_URL`.
+- `modules/anpr.py`: детектор номера (YOLO) + OCR (PaddleOCR) + нормализация KZ шаблонов.
 
-## Environment variables (.env example)
+### Логика снег → номер
+1) Воркер видит грузовик в центральной зоне, движение слева направо → кодирует кадр в JPEG, кладёт в очередь с `event_time`/`bbox` (без Gemini).
+2) При ANPR вебхуке мерджер ищет предыдущее снеговое в окне `MERGE_WINDOW_SECONDS` (snow раньше, plate позже). Просроченные (`MERGE_TTL_SECONDS`) удаляются.
+3) Если найдено: вызывает Gemini по `snowSnapshot` (обрезает по bbox), заполняет `snow_volume_percentage/confidence`, прикладывает `snowSnapshot.jpg`, `matched_snow=true`.
+4) Если не найдено или нет ключа Gemini: ставит нули, `matched_snow` остаётся по факту наличия матча; снимок снега прикладывается только при матче.
+5) События без валидного номера/уверенности пропускаются.
+
+### Логика ANPR вебхука
+- Путь 1 (multipart Hikvision): парсит `anpr.xml` (номер/время/уверенность), кадр `detectionPicture.jpg` прогоняется через свою модель. Если нет валидного номера/уверенности — пропуск. Если модель/камера не вернули номер, подставляется хардкод `747AO`, иначе отправляется реальный.
+- Путь 2 (fallback JPEG в body): только модель ANPR. Аналогично: при отсутствии валидного номера/уверенности — пропуск; хардкод ставится только если модель не дала номер.
+- Все события/пропуски пишутся в `hik_raws/detections.log`.
+
+## Переменные окружения (`.env` пример)
 ```
 UPSTREAM_URL=https://snowops-anpr-service.onrender.com/api/v1/anpr/events
+PLATE_CAMERA_ID=camera-001
 
 # merge timing
-MERGE_WINDOW_SECONDS=30      # max allowed delta (snow earlier, plate later) to merge
-MERGE_TTL_SECONDS=60         # how long to keep unmatched snow events
+MERGE_WINDOW_SECONDS=30
+MERGE_TTL_SECONDS=60
 
 # snow worker
 ENABLE_SNOW_WORKER=true
 SNOW_VIDEO_SOURCE_URL=rtsp://user:pass@host:port/Streaming/Channels/101
 SNOW_CAMERA_ID=camera-snow
 SNOW_YOLO_MODEL_PATH=yolov8n.pt
-SNAPSHOT_BASE_DIR=snapshots
 SNOW_CENTER_ZONE_START_X=0.35
 SNOW_CENTER_ZONE_END_X=0.65
 SNOW_CENTER_LINE_X=0.5
 SNOW_MIN_DIRECTION_DELTA=5
-SNOW_SHOW_WINDOW=false       # set true to see preview window
+SNOW_SHOW_WINDOW=false
 
-# Gemini
+# Gemini (нужен только при мердже со снегом)
 GEMINI_API_KEY=your_key
 GEMINI_MODEL=gemini-2.5-flash
 ```
 
-## Setup
+## Запуск
 ```bash
 python -m venv .venv
-.\.venv\Scripts\activate   # or source .venv/bin/activate
+.\.venv\Scripts\activate   # или source .venv/bin/activate
 pip install --upgrade pip
 pip install -r requirements.txt
-```
 
-## Run
-```bash
 uvicorn api:app --host 0.0.0.0 --port 8000 --env-file .env
 ```
-- Snow worker starts automatically if `ENABLE_SNOW_WORKER=true`.
-- Stop with Ctrl+C (background worker stops with the app).
+Если `ENABLE_SNOW_WORKER=true`, воркер стартует вместе с приложением. Остановка — Ctrl+C.
 
-## API endpoints
-- `GET /health` -> `{"status": "ok"}`
-- `POST /anpr` -> accepts `multipart/form-data` field `file` (JPEG/PNG), returns plate JSON.
-- `POST /api/v1/anpr/hikvision` -> Hikvision webhook (multipart with `anpr.xml` + images or raw JPEG fallback). This triggers plate inference and merging.
+## Эндпоинты
+- `GET /health` → `{"status": "ok"}`
+- `POST /anpr` → `multipart/form-data` с полем `file` (JPEG/PNG), отдаёт JSON с номером.
+- `POST /api/v1/anpr/hikvision` → вебхук Hikvision (multipart с `anpr.xml` + изображениями или raw JPEG fallback). Триггерит ANPR и мердж со снегом.
 
-## Upstream request (single merged event)
-Multipart `POST {UPSTREAM_URL}` with:
-- Field `event`: JSON string. Keys include:
-  - `camera_id` (plate camera id)
-  - `event_time` (from camera XML or now, ISO8601)
-  - `plate`, `camera_plate`, `camera_confidence`, `model_plate`, `model_det_conf`, `model_ocr_conf`, `timestamp`
-  - If matched snow: `snow_volume_percentage`, `snow_volume_confidence`, `snow_gemini_raw`, `matched_snow=true`
-  - Note: `snow_volume_m3` вычисляется на стороне Go сервиса: `(snow_volume_percentage / 100) * body_volume_m3`
-  - Note: для времени снежного события используется `event_time`, для камеры - `camera_id` (не дублируются)
-  - If no snow match yet: `matched_snow=false`
-- Field `photos` (one or several):
-  - `detectionPicture.jpg` (ANPR frame)
-  - `featurePicture.jpg` (optional)
-  - `licensePlatePicture.jpg` (optional)
-  - `snowSnapshot.jpg` (from snow worker, if matched)
+## Что уходит во внешний сервис (multipart на `UPSTREAM_URL`)
+- Поле `event` (строка JSON). Ключи:
+  - `camera_id` (`PLATE_CAMERA_ID`)
+  - `event_time` (из XML или сейчас, RFC3339)
+  - `plate`, `confidence`
+  - `camera_plate`, `camera_confidence` (из XML, если были)
+  - `model_plate`, `model_det_conf`, `model_ocr_conf`
+  - `direction`, `lane`, `vehicle` (заглушка `{}`)
+  - `timestamp` (время обработки)
+  - `original_plate_test` (оригинальный номер до возможного хардкода, для отладки)
+  - `matched_snow` (true/false)
+  - При матче со снегом: `snow_volume_percentage`, `snow_volume_confidence`, `snow_gemini_raw`
+  - При отсутствии матча: `snow_volume_percentage=0`, `snow_volume_confidence=0`, `matched_snow=false`
+- Поле `photos` (несколько файлов):
+  - `detectionPicture.jpg` — кадр ANPR (всегда при multipart Hikvision, при fallback — выдранный JPEG)
+  - `featurePicture.jpg` — если пришла
+  - `licensePlatePicture.jpg` — если пришла
+  - `snowSnapshot.jpg` — если было совпавшее снеговое событие
 
-## Data and logs
-- Plate webhook logs: `hik_raws/detections.log`
-- Snow snapshots/analysis: `snapshots/YYYY-MM-DD/HH-MM-SS.{jpg,json}`
+## Данные и логи
+- Логи вебхуков ANPR: `hik_raws/detections.log`
+- Снимки снега на диск не пишутся (всё в памяти).
 
-## Notes
-- Snow -> plate ordering is assumed; window/TTL control pairing. Adjust `MERGE_WINDOW_SECONDS`/`MERGE_TTL_SECONDS` to match camera spacing/speed.
-- Gemini must be configured (`GEMINI_API_KEY`). If Gemini fails, direction falls back to motion (left_to_right), percentage/confidence may be null.
+## Важные нюансы
+- Очередь снега чистится по TTL при добавлении/мердже; при полном простое старые элементы останутся в памяти до следующего события.
+- При отсутствии `GEMINI_API_KEY` снеговая часть ставится в нули, но при матче `matched_snow` остаётся true и `snowSnapshot.jpg` уходит.
+- В `.env` нельзя хранить реальные ключи/RTSP в репозитории.

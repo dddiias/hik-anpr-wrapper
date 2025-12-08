@@ -1,11 +1,16 @@
 import json
+import os
+import io
 import threading
+import time
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Deque, Dict, Optional
 
 import httpx
+from google import genai
+from PIL import Image
 
 
 def _parse_iso_dt(value: str | None) -> Optional[datetime]:
@@ -65,6 +70,14 @@ class EventMerger:
         self.ttl = timedelta(seconds=ttl_seconds)
         self._snow_events: Deque[SnowEvent] = deque()
         self._lock = threading.Lock()
+        self._gemini_client: genai.Client | None = None
+        self._gemini_api_key = os.getenv("GEMINI_API_KEY", "")
+        self._gemini_model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+        self._stop_cleanup = threading.Event()
+        self._cleanup_thread = threading.Thread(
+            target=self._cleanup_loop, daemon=True, name="merger-cleanup"
+        )
+        self._cleanup_thread.start()
 
     def _cleanup(self, now: datetime) -> None:
         while self._snow_events:
@@ -142,6 +155,127 @@ class EventMerger:
             f"queue size={len(self._snow_events)}"
         )
 
+    def _cleanup_loop(self) -> None:
+        """
+        Периодически чистит просроченные снеговые события, даже если нет новых запросов.
+        """
+        interval = max(1, int(self.ttl.total_seconds() / 2) or 1)
+        while not self._stop_cleanup.is_set():
+            time.sleep(interval)
+            now = datetime.now(tz=timezone.utc)
+            with self._lock:
+                self._cleanup(now)
+
+    def _get_gemini_client(self) -> genai.Client:
+        if self._gemini_client is None:
+            if not self._gemini_api_key:
+                raise RuntimeError("GEMINI_API_KEY is not set")
+            self._gemini_client = genai.Client(api_key=self._gemini_api_key)
+        return self._gemini_client
+
+    def _analyze_snow_gemini(
+        self, photo_bytes: bytes, bbox: Optional[Any]
+    ) -> Dict[str, Any]:
+        """
+        Analyze truck bed fill via Gemini using in-memory JPEG bytes.
+        """
+        if not self._gemini_api_key:
+            return {"error": "GEMINI_API_KEY is not set"}
+
+        try:
+            image = Image.open(io.BytesIO(photo_bytes)).convert("RGB")
+
+            if bbox:
+                try:
+                    x1, y1, x2, y2 = map(int, bbox)
+                    padding = 20
+                    x1 = max(0, x1 - padding)
+                    y1 = max(0, y1 - padding)
+                    x2 = min(image.width, x2 + padding)
+                    y2 = min(image.height, y2 + padding)
+                    image = image.crop((x1, y1, x2, y2))
+                except Exception:
+                    pass
+
+            prompt = (
+                "You see the cargo bed of a truck.\n"
+                "Focus ONLY on snow fill inside the open bed. Ignore road/roof/background.\n"
+                "Return JSON with fields:\n"
+                "- percentage: 0.0-1.0 or 0-100 for how full with snow\n"
+                "- confidence: 0.0-1.0\n\n"
+                "If no open truck bed is visible, set percentage=0 and confidence=0.\n\n"
+                "Example:\n"
+                "{\n"
+                '  \"percentage\": 0.42,\n'
+                '  \"confidence\": 0.9\n'
+                "}\n"
+            )
+
+            client = self._get_gemini_client()
+            response = client.models.generate_content(
+                model=self._gemini_model,
+                contents=[image, prompt],
+            )
+            text = (response.text or "").strip()
+            if not text:
+                return {"error": "Empty response from Gemini"}
+
+            if text.startswith("```"):
+                text = text.strip("`")
+                if text.lower().startswith("json"):
+                    text = text[4:].strip()
+
+            try:
+                return json.loads(text)
+            except json.JSONDecodeError as e:
+                return {"raw": text, "error": f"JSON parse error: {e}", "percentage": 0.0, "confidence": 0.0}
+        except Exception as e:
+            return {"error": str(e), "percentage": 0.0, "confidence": 0.0}
+
+    @staticmethod
+    def _extract_snow_fields(gemini_result: dict) -> tuple[Optional[float], Optional[float]]:
+        percentage = None
+        confidence = None
+        raw = None
+
+        if isinstance(gemini_result, dict):
+            percentage = gemini_result.get("percentage")
+            confidence = gemini_result.get("confidence")
+            raw = gemini_result.get("raw")
+
+        if (percentage is None or confidence is None) and raw:
+            raw_s = str(raw).strip()
+            try:
+                if raw_s.startswith("```"):
+                    raw_s = raw_s.strip("`")
+                    if raw_s.lower().startswith("json"):
+                        raw_s = raw_s[4:].strip()
+                parsed = json.loads(raw_s)
+                percentage = parsed.get("percentage") if percentage is None else percentage
+                confidence = parsed.get("confidence") if confidence is None else confidence
+            except Exception:
+                pass
+
+        try:
+            if percentage is not None:
+                val = float(percentage)
+                if 0.0 <= val <= 1.0:
+                    percentage = round(val * 100, 2)
+                elif 0 <= val <= 100:
+                    percentage = round(val, 2)
+                else:
+                    percentage = max(0.0, min(100.0, round(val, 2)))
+        except Exception:
+            percentage = None
+
+        try:
+            if confidence is not None:
+                confidence = float(confidence)
+        except Exception:
+            confidence = None
+
+        return percentage, confidence
+
     async def combine_and_send(
         self,
         anpr_event: Dict[str, Any],
@@ -164,22 +298,28 @@ class EventMerger:
             snow_event = self._pop_match(anpr_time)
 
         combined_event = dict(anpr_event)
+        snow_analysis = None
+
         if snow_event:
-            # Используем event_time и camera_id из основного события (не дублируем)
-            # snow_volume_m3 будет вычислен на стороне Go сервиса на основе процента и body_volume_m3
+            # Отложенный анализ: вызываем Gemini только когда есть матч с номером
+            if snow_event.photo_bytes and self._gemini_api_key:
+                print("[MERGER] Running Gemini analysis for matched snow event...")
+                snow_analysis = self._analyze_snow_gemini(
+                    snow_event.photo_bytes, snow_event.payload.get("bbox")
+                )
+                percentage, confidence = self._extract_snow_fields(snow_analysis)
+            else:
+                percentage, confidence = 0.0, 0.0
+
             combined_event.update(
                 {
-                    "snow_volume_percentage": snow_event.payload.get(
-                        "snow_volume_percentage", 0.0
-                    ),
-                    "snow_volume_confidence": snow_event.payload.get(
-                        "snow_volume_confidence", 0.0
-                    ),
+                    "snow_volume_percentage": percentage if percentage is not None else 0.0,
+                    "snow_volume_confidence": confidence if confidence is not None else 0.0,
                     "matched_snow": True,
                 }
             )
-            if "snow_gemini_raw" in snow_event.payload:
-                combined_event["snow_gemini_raw"] = snow_event.payload["snow_gemini_raw"]
+            if snow_analysis is not None:
+                combined_event["snow_gemini_raw"] = snow_analysis
         else:
             # Всегда заполняем поля о снеге, даже если снег не найден
             combined_event.update(

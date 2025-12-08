@@ -1,4 +1,3 @@
-import json
 import os
 import threading
 import time
@@ -7,8 +6,6 @@ from typing import Optional, Tuple
 
 import cv2
 import numpy as np
-from google import genai
-from PIL import Image
 from ultralytics import YOLO
 
 from combined_merger import init_merger
@@ -27,15 +24,10 @@ CENTER_ZONE_END_X = float(os.getenv("SNOW_CENTER_ZONE_END_X", "0.65"))
 CENTER_LINE_X = float(os.getenv("SNOW_CENTER_LINE_X", "0.5"))
 MIN_DIRECTION_DELTA = int(os.getenv("SNOW_MIN_DIRECTION_DELTA", "5"))
 
-SNAPSHOT_BASE_DIR = os.getenv("SNAPSHOT_BASE_DIR", "snapshots")
 SHOW_WINDOW = os.getenv("SNOW_SHOW_WINDOW", "false").lower() == "true"
-
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
 _snow_thread: threading.Thread | None = None
 _stop_event = threading.Event()
-_gemini_client: genai.Client | None = None
 
 
 # === Вспомогательные функции из старого снежного сервиса ===
@@ -92,161 +84,6 @@ def _encode_frame_to_jpeg(frame: np.ndarray) -> Tuple[bytes, datetime]:
     if not ok:
         raise RuntimeError("cannot encode frame to JPEG")
     return buf.tobytes(), ts
-
-
-def _get_gemini_client() -> genai.Client:
-    global _gemini_client
-    if _gemini_client is None:
-        if not GEMINI_API_KEY:
-            raise RuntimeError("GEMINI_API_KEY is not set")
-        _gemini_client = genai.Client(api_key=GEMINI_API_KEY)
-    return _gemini_client
-
-
-def _analyze_snow_gemini(image: Image.Image, bbox: Optional[Tuple[int, int, int, int]] = None) -> dict:
-    """
-    Send in-memory PIL image to Gemini and expect JSON with percentage/confidence.
-    Nothing is written to disk.
-    """
-    print(f"[GEMINI] STARTING ANALYSIS: bbox={bbox}")
-    try:
-        if not GEMINI_API_KEY:
-            error_msg = "GEMINI_API_KEY is not set"
-            print(f"[GEMINI] ERROR: {error_msg}")
-            return {"error": error_msg}
-
-        client = _get_gemini_client()
-        work_image = image.convert("RGB")
-
-        if bbox:
-            x1, y1, x2, y2 = bbox
-            padding = 20
-            x1 = max(0, x1 - padding)
-            y1 = max(0, y1 - padding)
-            x2 = min(work_image.width, x2 + padding)
-            y2 = min(work_image.height, y2 + padding)
-            work_image = work_image.crop((x1, y1, x2, y2))
-            print(
-                f"[GEMINI] cropped image to bbox: ({x1}, {y1}, {x2}, {y2}), "
-                f"cropped size: {work_image.width}x{work_image.height}"
-            )
-
-        prompt = (
-            "You see the cargo bed of a truck.
-"
-            "Focus ONLY on snow fill inside the open bed. Ignore road/roof/background.
-"
-            "Return JSON with fields:
-"
-            "- percentage: 0.0-1.0 or 0-100 for how full with snow
-"
-            "- confidence: 0.0-1.0
-
-"
-            "If no open truck bed is visible, set percentage=0 and confidence=0.
-
-"
-            "Example:
-"
-            "{
-"
-            '  "percentage": 0.42,
-'
-            '  "confidence": 0.9
-'
-            "}
-"
-        )
-        print(f"[GEMINI] Sending request to Gemini API (model={GEMINI_MODEL})...")
-
-        response = client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=[work_image, prompt],
-        )
-
-        text = (response.text or "").strip()
-
-        if not text:
-            error_msg = "Empty response from Gemini"
-            print(f"[GEMINI] ERROR: {error_msg}")
-            return {"error": error_msg}
-
-        if text.startswith("```"):
-            text = text.strip("`")
-            if text.lower().startswith("json"):
-                text = text[4:].strip()
-
-        try:
-            data = json.loads(text)
-            print(f"[GEMINI] SUCCESS: parsed JSON: {data}")
-            return data
-        except json.JSONDecodeError as e:
-            error_msg = f"JSON parse error: {str(e)}"
-            print(f"[GEMINI] ERROR: {error_msg}")
-            return {"raw": text, "error": error_msg, "percentage": 0.0, "confidence": 0.0}
-    except Exception as e:
-        error_msg = f"Exception in Gemini analysis: {str(e)}"
-        print(f"[GEMINI] ERROR: {error_msg}")
-        import traceback
-        traceback.print_exc()
-        return {"error": error_msg, "percentage": 0.0, "confidence": 0.0}
-
-
-def _extract_gemini_fields(gemini_result: dict):
-    percentage = None
-    confidence = None
-    direction = None
-
-    if isinstance(gemini_result, dict):
-        percentage = gemini_result.get("percentage")
-        confidence = gemini_result.get("confidence")
-        direction = gemini_result.get("direction")
-        raw = gemini_result.get("raw")
-    else:
-        raw = None
-
-    if (percentage is None or confidence is None or direction is None) and raw:
-        raw_s = str(raw).strip()
-        try:
-            if raw_s.startswith("```"):
-                raw_s = raw_s.strip("`")
-                if raw_s.lower().startswith("json"):
-                    raw_s = raw_s[4:].strip()
-            parsed = json.loads(raw_s)
-            percentage = parsed.get("percentage") if percentage is None else percentage
-            confidence = parsed.get("confidence") if confidence is None else confidence
-            direction = parsed.get("direction") if direction is None else direction
-        except Exception:
-            pass
-
-    try:
-        if percentage is not None:
-            percentage_float = float(percentage)
-            # Gemini возвращает значения от 0 до 1, где 0 - пусто, 1 - полностью заполнено
-            # Конвертируем в проценты (0-100), но оставляем как float для точности
-            if 0.0 <= percentage_float <= 1.0:
-                # Если значение от 0 до 1, умножаем на 100
-                percentage = round(percentage_float * 100, 2)
-            elif 0 <= percentage_float <= 100:
-                # Если уже в процентах (0-100), просто округляем до 2 знаков
-                percentage = round(percentage_float, 2)
-            else:
-                # Если значение вне диапазона, обрезаем до 0-100
-                percentage = max(0.0, min(100.0, round(percentage_float, 2)))
-    except Exception as e:
-        print(f"[SNOW] Error converting percentage: {e}, value: {percentage}")
-        percentage = None
-
-    try:
-        if confidence is not None:
-            confidence = float(confidence)
-    except Exception:
-        confidence = None
-
-    if direction is not None:
-        direction = str(direction).strip().lower()
-
-    return percentage, confidence, direction
 
 
 # === Основной цикл снежной камеры ===
@@ -356,12 +193,12 @@ def _snow_loop(upstream_url: str):
                 # Дополнительная визуализация только если окно включено
                 pass
 
-            # Сохраняем снапшот и отправляем событие, если:
+            # Сохраняем снапшот и кладем в очередь без анализа, если:
             # 1. Грузовик в зоне
             # 2. Движется слева направо (подтверждено на втором кадре)
             # 3. Еще не отправлено событие для этого грузовика
             if in_zone and moving_right and not event_sent_for_current_truck:
-                print(f"[SNOW] ===== ENCODING SNAPSHOT AND ANALYZING (IN-MEMORY) ======")
+                print(f"[SNOW] ===== ENCODING SNAPSHOT AND QUEUING (IN-MEMORY) ======")
                 try:
                     photo_bytes, ts_saved = _encode_frame_to_jpeg(raw_frame)
                 except Exception as e:
@@ -369,47 +206,21 @@ def _snow_loop(upstream_url: str):
                     photo_bytes = None
                     ts_saved = datetime.now(tz=timezone.utc)
 
-                # Pass bbox so Gemini focuses on the truck area
-                print(f"[SNOW] Calling Gemini API for snow analysis...")
-                pil_image = Image.fromarray(cv2.cvtColor(raw_frame, cv2.COLOR_BGR2RGB))
-                gemini_result = _analyze_snow_gemini(pil_image, bbox)
-                print(f"[SNOW] Gemini analysis completed, result: {gemini_result}")
-
-                percentage, confidence, _ = _extract_gemini_fields(gemini_result)
-                
-                # Safety guard: default to zeros if Gemini returned nothing
-                print(f"[SNOW] ===== GEMINI RESULT ======")
-                print(f"[SNOW] percentage={percentage}, confidence={confidence}")
-                print(f"[SNOW] gemini_result keys: {list(gemini_result.keys()) if isinstance(gemini_result, dict) else 'not a dict'}")
-                
-                # If percentage or confidence is missing, zero them out
-                if percentage is None:
-                    print(f"[SNOW] WARNING: percentage is None, setting to 0, gemini_result={gemini_result}")
-                    percentage = 0
-                if confidence is None:
-                    print(f"[SNOW] WARNING: confidence is None, setting to 0.0")
-                    confidence = 0.0
-
-                # Format timestamp as RFC3339 (ISO8601) with Z suffix
+                # Формируем время события в RFC3339 (ISO8601) с суффиксом Z
                 event_time_iso = ts_saved.replace(microsecond=0).isoformat()
-                # If timezone is +00:00, convert to Z
                 if event_time_iso.endswith("+00:00"):
                     event_time_iso = event_time_iso[:-6] + "Z"
                 elif "+" in event_time_iso or "-" in event_time_iso[-6:]:
-                    # If other timezone exists, keep as-is
                     pass
                 else:
-                    # If no timezone, append Z
                     event_time_iso += "Z"
                 
                 payload = {
                     "camera_id": SNOW_CAMERA_ID,
                     "event_time": event_time_iso,
-                    "snow_volume_percentage": percentage if percentage is not None else 0,
-                    "snow_volume_confidence": confidence if confidence is not None else 0.0,
-                    "snow_gemini_raw": gemini_result,
+                    "bbox": list(bbox) if bbox else None,
                 }
-                print(f"[SNOW] payload: {payload}")
+                print(f"[SNOW] payload queued (no Gemini yet): {payload}")
 
                 merger.add_snow_event(payload, photo_bytes)
                 print(f"[SNOW] snow event added to queue, queue_size should increase")
