@@ -414,35 +414,35 @@ async def hikvision_isapi(request: Request):
                 f.write(json.dumps(log_event, ensure_ascii=False) + "\n")
             return JSONResponse({"status": "ok"})
         
+        # ВРЕМЕННО ДЛЯ ТЕСТОВ: хардкод всегда срабатывает
         # Если есть anpr.xml, но (нет нормального номера ИЛИ низкая уверенность) - не отправляем
         # Это предотвращает отправку событий с плохо распознанными номерами даже если есть anpr.xml
-        if has_anpr_xml and (not has_valid_plate or not has_valid_confidence):
-            print(f"[HIK] SKIPPING EVENT: anpr.xml exists but plate='{main_plate}' is invalid and confidence too low (det_conf={model_det_conf}, ocr_conf={model_ocr_conf}, camera_conf={camera_conf})")
-            # Логируем пропущенное событие
-            log_event = {
-                "timestamp": now_iso,
-                "kind": "skipped_low_confidence",
-                "has_anpr_xml": has_anpr_xml,
-                "plate": main_plate,
-                "model_plate": model_plate,
-                "camera_plate": camera_plate,
-                "model_det_conf": model_det_conf,
-                "model_ocr_conf": model_ocr_conf,
-                "camera_conf": camera_conf,
-                "upstream_sent": False,
-                "upstream_status": None,
-                "upstream_error": "skipped: invalid plate and low confidence",
-            }
-            log_path = BASE_DIR / "detections.log"
-            with log_path.open("a", encoding="utf-8") as f:
-                f.write(json.dumps(log_event, ensure_ascii=False) + "\n")
-            return JSONResponse({"status": "ok"})
+        # if has_anpr_xml and (not has_valid_plate or not has_valid_confidence):
+        #     print(f"[HIK] SKIPPING EVENT: anpr.xml exists but plate='{main_plate}' is invalid and confidence too low (det_conf={model_det_conf}, ocr_conf={model_ocr_conf}, camera_conf={camera_conf})")
+        #     # Логируем пропущенное событие
+        #     log_event = {
+        #         "timestamp": now_iso,
+        #         "kind": "skipped_low_confidence",
+        #         "has_anpr_xml": has_anpr_xml,
+        #         "plate": main_plate,
+        #         "model_plate": model_plate,
+        #         "camera_plate": camera_plate,
+        #         "model_det_conf": model_det_conf,
+        #         "model_ocr_conf": model_ocr_conf,
+        #         "camera_conf": camera_conf,
+        #         "upstream_sent": False,
+        #         "upstream_status": None,
+        #         "upstream_error": "skipped: invalid plate and low confidence",
+        #     }
+        #     log_path = BASE_DIR / "detections.log"
+        #     with log_path.open("a", encoding="utf-8") as f:
+        #         f.write(json.dumps(log_event, ensure_ascii=False) + "\n")
+        #     return JSONResponse({"status": "ok"})
 
-        # Используем нормальный номер, а хардкодим только если и камера, и модель не дали валидное значение
+        # ВРЕМЕННО ДЛЯ ТЕСТОВ: всегда подставляем хардкод "747AO"
         original_plate = main_plate
-        if not (main_plate and main_plate.strip() and main_plate != "unknown"):
-            main_plate = "747AO"
-            print(f"[TEST] fallback plate applied: '{original_plate}' -> '{main_plate}'")
+        main_plate = "747AO"
+        print(f"[TEST] TEST MODE: always using hardcoded plate '{main_plate}' (original was '{original_plate}')")
 
         event_data: Dict[str, Any] = {
             # контракт бэкенда (обязательные поля)
@@ -570,31 +570,31 @@ async def hikvision_isapi(request: Request):
     if model_det_conf is not None and model_ocr_conf is not None:
         has_valid_confidence = model_det_conf >= 0.3 and model_ocr_conf >= 0.5
     
+    # ВРЕМЕННО ДЛЯ ТЕСТОВ: пропускаем проверки и всегда отправляем с хардкодом
     # Если нет нормального номера ИЛИ нет достаточной уверенности - не отправляем событие
     # Это предотвращает отправку событий с плохо распознанными номерами
-    if not has_valid_plate or not has_valid_confidence:
-        print(f"[HIK] SKIPPING EVENT (fallback): plate='{main_plate}', det_conf={model_det_conf}, ocr_conf={model_ocr_conf}")
-        # Логируем пропущенное событие
-        log_event = {
-            "timestamp": now_iso,
-            "kind": "skipped_fallback_no_valid_data",
-            "plate": main_plate,
-            "model_det_conf": model_det_conf,
-            "model_ocr_conf": model_ocr_conf,
-            "upstream_sent": False,
-            "upstream_status": None,
-            "upstream_error": "skipped: no valid plate and low confidence",
-        }
-        log_path = BASE_DIR / "detections.log"
-        with log_path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(log_event, ensure_ascii=False) + "\n")
-        return JSONResponse({"status": "ok"})
+    # if not has_valid_plate or not has_valid_confidence:
+    #     print(f"[HIK] SKIPPING EVENT (fallback): plate='{main_plate}', det_conf={model_det_conf}, ocr_conf={model_ocr_conf}")
+    #     # Логируем пропущенное событие
+    #     log_event = {
+    #         "timestamp": now_iso,
+    #         "kind": "skipped_fallback_no_valid_data",
+    #         "plate": main_plate,
+    #         "model_det_conf": model_det_conf,
+    #         "model_ocr_conf": model_ocr_conf,
+    #         "upstream_sent": False,
+    #         "upstream_status": None,
+    #         "upstream_error": "skipped: no valid plate and low confidence",
+    #     }
+    #     log_path = BASE_DIR / "detections.log"
+    #     with log_path.open("a", encoding="utf-8") as f:
+    #         f.write(json.dumps(log_event, ensure_ascii=False) + "\n")
+    #     return JSONResponse({"status": "ok"})
 
-    # Используем нормальный номер, а хардкодим только если модель ничего не дала
+    # ВРЕМЕННО ДЛЯ ТЕСТОВ: всегда подставляем хардкод "747AO"
     original_plate = main_plate  # Сохраняем оригинальный номер для логов
-    if not (main_plate and main_plate.strip() and main_plate != "unknown"):
-        main_plate = "747AO"
-        print(f"[TEST] fallback plate applied: '{original_plate}' -> '{main_plate}'")
+    main_plate = "747AO"
+    print(f"[TEST] TEST MODE: always using hardcoded plate '{main_plate}' (original was '{original_plate}')")
 
     event_data: Dict[str, Any] = {
         # контракт бэкенда (обязательные поля)

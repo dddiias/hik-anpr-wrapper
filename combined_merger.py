@@ -13,6 +13,12 @@ from google import genai
 from PIL import Image
 
 
+# Максимальный возраст события для матчинга (секунды)
+# События старше этого возраста не будут матчиться с ANPR событиями
+# Это предотвращает матчинг старых событий от стоячих машин с новыми ANPR событиями
+MAX_EVENT_AGE_SECONDS = float(os.getenv("MERGE_MAX_EVENT_AGE_SECONDS", "15.0"))
+
+
 def _parse_iso_dt(value: str | None) -> Optional[datetime]:
     """
     Parse ISO8601 datetime string into aware UTC datetime.
@@ -117,6 +123,11 @@ class EventMerger:
                 print(f"[MERGER] DEBUG: snow[{idx}] is in future, skipping")
                 continue
             if delta <= self.window:
+                # Дополнительная проверка: событие не должно быть слишком старым
+                # Это предотвращает матчинг старых событий от стоячих машин с новыми ANPR событиями
+                if delta.total_seconds() > MAX_EVENT_AGE_SECONDS:
+                    print(f"[MERGER] DEBUG: snow[{idx}] too old ({delta_seconds:.1f}s > {MAX_EVENT_AGE_SECONDS}s), skipping (likely stationary truck)")
+                    continue
                 if best_delta is None or delta < best_delta:
                     best_delta = delta
                     best_idx = idx
@@ -180,10 +191,16 @@ class EventMerger:
         Analyze truck bed fill via Gemini using in-memory JPEG bytes.
         """
         if not self._gemini_api_key:
+            print("[GEMINI] ERROR: GEMINI_API_KEY is not set")
             return {"error": "GEMINI_API_KEY is not set"}
 
         try:
+            import time as time_module
+            start_time = time_module.time()
+            
             image = Image.open(io.BytesIO(photo_bytes)).convert("RGB")
+            original_size = (image.width, image.height)
+            print(f"[GEMINI] Starting analysis: original image size={original_size}, bbox={bbox}")
 
             if bbox:
                 try:
@@ -194,8 +211,9 @@ class EventMerger:
                     x2 = min(image.width, x2 + padding)
                     y2 = min(image.height, y2 + padding)
                     image = image.crop((x1, y1, x2, y2))
-                except Exception:
-                    pass
+                    print(f"[GEMINI] Cropped image: size=({image.width}, {image.height}), crop=({x1},{y1},{x2},{y2})")
+                except Exception as e:
+                    print(f"[GEMINI] WARNING: Failed to crop image: {e}")
 
             prompt = (
                 "You see the cargo bed of a truck.\n"
@@ -210,26 +228,42 @@ class EventMerger:
                 '  \"confidence\": 0.9\n'
                 "}\n"
             )
+            print(f"[GEMINI] Sending request to model={self._gemini_model}, prompt_length={len(prompt)} chars")
 
             client = self._get_gemini_client()
             response = client.models.generate_content(
                 model=self._gemini_model,
                 contents=[image, prompt],
             )
+            
+            request_duration = time_module.time() - start_time
             text = (response.text or "").strip()
+            print(f"[GEMINI] Response received in {request_duration:.2f}s, response_length={len(text)} chars")
+            print(f"[GEMINI] Raw response (first 200 chars): {text[:200]}")
+            
             if not text:
+                print("[GEMINI] ERROR: Empty response from Gemini")
                 return {"error": "Empty response from Gemini"}
 
+            original_text = text
             if text.startswith("```"):
                 text = text.strip("`")
                 if text.lower().startswith("json"):
                     text = text[4:].strip()
+                print(f"[GEMINI] Cleaned response (removed markdown): length={len(text)} chars")
 
             try:
-                return json.loads(text)
+                result = json.loads(text)
+                print(f"[GEMINI] Successfully parsed JSON: {result}")
+                return result
             except json.JSONDecodeError as e:
-                return {"raw": text, "error": f"JSON parse error: {e}", "percentage": 0.0, "confidence": 0.0}
+                print(f"[GEMINI] ERROR: JSON parse failed: {e}")
+                print(f"[GEMINI] Failed to parse text: {text[:500]}")
+                return {"raw": original_text, "error": f"JSON parse error: {e}", "percentage": 0.0, "confidence": 0.0}
         except Exception as e:
+            print(f"[GEMINI] EXCEPTION: {type(e).__name__}: {e}")
+            import traceback
+            print(f"[GEMINI] Traceback: {traceback.format_exc()}")
             return {"error": str(e), "percentage": 0.0, "confidence": 0.0}
 
     @staticmethod
@@ -294,7 +328,7 @@ class EventMerger:
         print(f"[MERGER] DEBUG: anpr_event_time_str='{anpr_time_str}', parsed={anpr_time.isoformat()}, now={now.isoformat()}")
 
         with self._lock:
-            self._cleanup(now)
+            self._cleanup(anpr_time)  # Используем anpr_time вместо now для корректной очистки
             snow_event = self._pop_match(anpr_time)
 
         combined_event = dict(anpr_event)
@@ -303,12 +337,18 @@ class EventMerger:
         if snow_event:
             # Отложенный анализ: вызываем Gemini только когда есть матч с номером
             if snow_event.photo_bytes and self._gemini_api_key:
-                print("[MERGER] Running Gemini analysis for matched snow event...")
+                print(f"[MERGER] Running Gemini analysis for matched snow event (photo_size={len(snow_event.photo_bytes)} bytes, bbox={snow_event.payload.get('bbox')})...")
                 snow_analysis = self._analyze_snow_gemini(
                     snow_event.photo_bytes, snow_event.payload.get("bbox")
                 )
+                print(f"[MERGER] Gemini analysis result: {snow_analysis}")
                 percentage, confidence = self._extract_snow_fields(snow_analysis)
+                print(f"[MERGER] Extracted snow fields: percentage={percentage}, confidence={confidence}")
             else:
+                if not snow_event.photo_bytes:
+                    print("[MERGER] WARNING: snow_event.photo_bytes is None or empty")
+                if not self._gemini_api_key:
+                    print("[MERGER] WARNING: GEMINI_API_KEY is not set")
                 percentage, confidence = 0.0, 0.0
 
             combined_event.update(
@@ -318,6 +358,7 @@ class EventMerger:
                     "matched_snow": True,
                 }
             )
+            print(f"[MERGER] Final combined event snow fields: percentage={combined_event.get('snow_volume_percentage')}, confidence={combined_event.get('snow_volume_confidence')}")
             if snow_analysis is not None:
                 combined_event["snow_gemini_raw"] = snow_analysis
         else:
