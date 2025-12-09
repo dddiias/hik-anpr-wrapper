@@ -1,4 +1,5 @@
 from typing import Any, Dict
+import os
 import pathlib
 import datetime
 import json
@@ -11,6 +12,7 @@ from fastapi import FastAPI, File, UploadFile, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from modules.anpr import ANPR
+from combined_merger import init_merger
 
 app = FastAPI(
     title="Hikvision ANPR Wrapper",
@@ -22,12 +24,35 @@ app = FastAPI(
 engine = ANPR()
 
 # URL внешнего сервиса, куда шлём JSON + фото
-UPSTREAM_URL = "https://snowops-anpr-service.onrender.com/api/v1/anpr/events"
+UPSTREAM_URL = os.getenv(
+    "UPSTREAM_URL", "https://snowops-anpr-service.onrender.com/api/v1/anpr/events"
+)
+PLATE_CAMERA_ID = os.getenv("PLATE_CAMERA_ID", "camera-001")
+MERGE_WINDOW_SECONDS = int(os.getenv("MERGE_WINDOW_SECONDS", "30"))
+MERGE_TTL_SECONDS = int(os.getenv("MERGE_TTL_SECONDS", "60"))
+ENABLE_SNOW_WORKER = os.getenv("ENABLE_SNOW_WORKER", "false").lower() == "true"
+
+merger = init_merger(
+    upstream_url=UPSTREAM_URL,
+    window_seconds=MERGE_WINDOW_SECONDS,
+    ttl_seconds=MERGE_TTL_SECONDS,
+)
 
 
 @app.get("/health", summary="Health")
 def health() -> Dict[str, str]:
     return {"status": "ok"}
+
+
+@app.on_event("startup")
+async def start_background_workers():
+    if ENABLE_SNOW_WORKER:
+        from snow_worker import start_snow_worker, SNOW_VIDEO_SOURCE_URL
+
+        print(f"[STARTUP] snow worker enabled, source={SNOW_VIDEO_SOURCE_URL}")
+        start_snow_worker(UPSTREAM_URL)
+    else:
+        print("[STARTUP] snow worker disabled (set ENABLE_SNOW_WORKER=true to enable)")
 
 
 @app.post("/anpr", summary="Recognize Plate")
@@ -327,20 +352,107 @@ async def hikvision_isapi(request: Request):
 
         # === Формируем JSON-событие в простом виде ===
 
-        now_iso = datetime.datetime.now().isoformat()
+        # Используем UTC timezone для RFC3339 формата (требуется Go)
+        now_utc = datetime.datetime.now(datetime.timezone.utc)
+        now_iso = now_utc.isoformat().replace('+00:00', 'Z')  # RFC3339 формат
 
         camera_plate = camera_info.get("plate")
         camera_conf = camera_info.get("confidence")
-        event_time = camera_info.get("date_time") or now_iso
+        
+        # Парсим event_time из камеры или используем текущее время
+        event_time_str = camera_info.get("date_time")
+        if event_time_str:
+            # Пытаемся распарсить время от камеры
+            try:
+                # Если камера отправляет без timezone, добавляем UTC
+                if 'Z' not in event_time_str and '+' not in event_time_str:
+                    event_time_str = event_time_str + 'Z'
+                event_time = event_time_str
+            except Exception:
+                event_time = now_iso
+        else:
+            event_time = now_iso
 
         # основной номер события для поля plate (обязателен для бэкенда)
         main_plate = model_plate or camera_plate
 
+        # Проверка: есть ли anpr.xml от камеры
+        has_anpr_xml = camera_xml_path is not None
+        
+        # Проверка: есть ли нормальный номер (не None и не пустая строка)
+        has_valid_plate = main_plate and main_plate.strip() and main_plate != "unknown"
+        
+        # Проверка уверенности: модель должна иметь достаточную уверенность
+        # det_conf >= 0.3 и ocr_conf >= 0.5, или camera_conf >= 0.5
+        has_valid_confidence = False
+        if model_det_conf is not None and model_ocr_conf is not None:
+            has_valid_confidence = model_det_conf >= 0.3 and model_ocr_conf >= 0.5
+        elif camera_conf is not None:
+            has_valid_confidence = camera_conf >= 0.5
+        
+        # Если нет anpr.xml И (нет нормального номера ИЛИ нет достаточной уверенности) - не отправляем событие
+        # Это предотвращает отправку событий с плохо распознанными номерами
+        if not has_anpr_xml and (not has_valid_plate or not has_valid_confidence):
+            print(f"[HIK] SKIPPING EVENT: no anpr.xml, plate='{main_plate}', det_conf={model_det_conf}, ocr_conf={model_ocr_conf}, camera_conf={camera_conf}")
+            # Логируем пропущенное событие
+            log_event = {
+                "timestamp": now_iso,
+                "kind": "skipped_no_valid_data",
+                "has_anpr_xml": has_anpr_xml,
+                "plate": main_plate,
+                "model_plate": model_plate,
+                "camera_plate": camera_plate,
+                "model_det_conf": model_det_conf,
+                "model_ocr_conf": model_ocr_conf,
+                "camera_conf": camera_conf,
+                "upstream_sent": False,
+                "upstream_status": None,
+                "upstream_error": "skipped: no valid plate and low confidence",
+            }
+            log_path = BASE_DIR / "detections.log"
+            with log_path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(log_event, ensure_ascii=False) + "\n")
+            return JSONResponse({"status": "ok"})
+        
+        # ВРЕМЕННО ДЛЯ ТЕСТОВ: хардкод всегда срабатывает
+        # Если есть anpr.xml, но (нет нормального номера ИЛИ низкая уверенность) - не отправляем
+        # Это предотвращает отправку событий с плохо распознанными номерами даже если есть anpr.xml
+        # if has_anpr_xml and (not has_valid_plate or not has_valid_confidence):
+        #     print(f"[HIK] SKIPPING EVENT: anpr.xml exists but plate='{main_plate}' is invalid and confidence too low (det_conf={model_det_conf}, ocr_conf={model_ocr_conf}, camera_conf={camera_conf})")
+        #     # Логируем пропущенное событие
+        #     log_event = {
+        #         "timestamp": now_iso,
+        #         "kind": "skipped_low_confidence",
+        #         "has_anpr_xml": has_anpr_xml,
+        #         "plate": main_plate,
+        #         "model_plate": model_plate,
+        #         "camera_plate": camera_plate,
+        #         "model_det_conf": model_det_conf,
+        #         "model_ocr_conf": model_ocr_conf,
+        #         "camera_conf": camera_conf,
+        #         "upstream_sent": False,
+        #         "upstream_status": None,
+        #         "upstream_error": "skipped: invalid plate and low confidence",
+        #     }
+        #     log_path = BASE_DIR / "detections.log"
+        #     with log_path.open("a", encoding="utf-8") as f:
+        #         f.write(json.dumps(log_event, ensure_ascii=False) + "\n")
+        #     return JSONResponse({"status": "ok"})
+
+        # ВРЕМЕННО ДЛЯ ТЕСТОВ: всегда подставляем хардкод "747AO"
+        original_plate = main_plate
+        main_plate = "747AO"
+        print(f"[TEST] TEST MODE: always using hardcoded plate '{main_plate}' (original was '{original_plate}')")
+
         event_data: Dict[str, Any] = {
-            # контракт бэкенда
-            "camera_id": "camera-001",  # TODO: подставь реальный ID камеры
-            "event_time": event_time,
+            # контракт бэкенда (обязательные поля)
+            "camera_id": PLATE_CAMERA_ID,  # можно сконфигурировать через env
+            "event_time": event_time,  # RFC3339 формат с timezone
             "plate": main_plate,
+            "confidence": float(camera_conf) if camera_conf is not None else 0.0,  # обязательное поле
+            "direction": camera_info.get("direction", "unknown"),  # обязательное поле
+            "lane": int(camera_info.get("lane", 0)),  # обязательное поле
+            "vehicle": {},  # обязательное поле (пустой объект если нет данных)
 
             # понятные поля
             "camera_plate": camera_plate,
@@ -348,26 +460,45 @@ async def hikvision_isapi(request: Request):
             "model_plate": model_plate,
             "model_det_conf": model_det_conf,
             "model_ocr_conf": model_ocr_conf,
+            "xml_event_type": camera_info.get("event_type"),  # тип события из anpr.xml
+            
+            # TODO: ВРЕМЕННО - оригинальный номер для отладки
+            "original_plate_test": original_plate,
 
             # доп. служебное время
             "timestamp": now_iso,
         }
 
         # 5) Отправляем JSON + фото на внешний сервис и получаем результат
-        upstream_result = await send_to_upstream(
-            event_data=event_data,
+        # Логируем, какие файлы есть
+        files_info = []
+        if detection_bytes:
+            files_info.append(f"detection({len(detection_bytes)} bytes)")
+        if feature_bytes:
+            files_info.append(f"feature({len(feature_bytes)} bytes)")
+        if license_bytes:
+            files_info.append(f"license({len(license_bytes)} bytes)")
+        print(f"[HIK] files to send: {files_info if files_info else 'NONE'}")
+        
+        upstream_result = await merger.combine_and_send(
+            anpr_event=event_data,
             detection_bytes=detection_bytes,
             feature_bytes=feature_bytes,
             license_bytes=license_bytes,
         )
 
-        # 6) Логируем в detections.log (включая статус отправки)
+        # 6) Логируем в detections.log (включая статус отправки и данные снега)
         log_event = {
             **event_data,
             "upstream_sent": upstream_result["sent"],
             "upstream_status": upstream_result["status"],
             "upstream_error": upstream_result["error"],
+            "matched_snow": upstream_result.get("matched_snow"),
         }
+        
+        # Добавляем данные снега в лог, если они есть
+        if "snow_data" in upstream_result:
+            log_event.update(upstream_result["snow_data"])
 
         log_path = BASE_DIR / "detections.log"
         with log_path.open("a", encoding="utf-8") as f:
@@ -423,26 +554,73 @@ async def hikvision_isapi(request: Request):
     model_ocr_conf = anpr_res.get("ocr_conf")
     model_bbox = anpr_res.get("bbox")
 
-    now_iso = datetime.datetime.now().isoformat()
+    # Используем UTC timezone для RFC3339 формата (требуется Go)
+    now_utc = datetime.datetime.now(datetime.timezone.utc)
+    now_iso = now_utc.isoformat().replace('+00:00', 'Z')  # RFC3339 формат
 
     # тут камеры нет, только модель
     main_plate = model_plate
 
+    # Проверка: есть ли нормальный номер (не None и не пустая строка)
+    has_valid_plate = main_plate and main_plate.strip() and main_plate != "unknown"
+    
+    # Проверка уверенности: модель должна иметь достаточную уверенность
+    # det_conf >= 0.3 и ocr_conf >= 0.5
+    has_valid_confidence = False
+    if model_det_conf is not None and model_ocr_conf is not None:
+        has_valid_confidence = model_det_conf >= 0.3 and model_ocr_conf >= 0.5
+    
+    # ВРЕМЕННО ДЛЯ ТЕСТОВ: пропускаем проверки и всегда отправляем с хардкодом
+    # Если нет нормального номера ИЛИ нет достаточной уверенности - не отправляем событие
+    # Это предотвращает отправку событий с плохо распознанными номерами
+    # if not has_valid_plate or not has_valid_confidence:
+    #     print(f"[HIK] SKIPPING EVENT (fallback): plate='{main_plate}', det_conf={model_det_conf}, ocr_conf={model_ocr_conf}")
+    #     # Логируем пропущенное событие
+    #     log_event = {
+    #         "timestamp": now_iso,
+    #         "kind": "skipped_fallback_no_valid_data",
+    #         "plate": main_plate,
+    #         "model_det_conf": model_det_conf,
+    #         "model_ocr_conf": model_ocr_conf,
+    #         "upstream_sent": False,
+    #         "upstream_status": None,
+    #         "upstream_error": "skipped: no valid plate and low confidence",
+    #     }
+    #     log_path = BASE_DIR / "detections.log"
+    #     with log_path.open("a", encoding="utf-8") as f:
+    #         f.write(json.dumps(log_event, ensure_ascii=False) + "\n")
+    #     return JSONResponse({"status": "ok"})
+
+    # ВРЕМЕННО ДЛЯ ТЕСТОВ: всегда подставляем хардкод "747AO"
+    original_plate = main_plate  # Сохраняем оригинальный номер для логов
+    main_plate = "747AO"
+    print(f"[TEST] TEST MODE: always using hardcoded plate '{main_plate}' (original was '{original_plate}')")
+
     event_data: Dict[str, Any] = {
-        "camera_id": "camera-001",
-        "event_time": now_iso,
+        # контракт бэкенда (обязательные поля)
+        "camera_id": PLATE_CAMERA_ID,
+        "event_time": now_iso,  # RFC3339 формат с timezone
         "plate": main_plate,
+        "confidence": float(model_ocr_conf) if model_ocr_conf is not None else 0.0,  # обязательное поле
+        "direction": "unknown",  # обязательное поле
+        "lane": 0,  # обязательное поле
+        "vehicle": {},  # обязательное поле (пустой объект если нет данных)
+        
         "camera_plate": None,
         "camera_confidence": None,
         "model_plate": model_plate,
         "model_det_conf": model_det_conf,
         "model_ocr_conf": model_ocr_conf,
+        
+        # TODO: ВРЕМЕННО - оригинальный номер для отладки
+        "original_plate_test": original_plate,
+
         "timestamp": now_iso,
     }
 
     # Отправляем только одну картинку как detection_picture
-    upstream_result = await send_to_upstream(
-        event_data=event_data,
+    upstream_result = await merger.combine_and_send(
+        anpr_event=event_data,
         detection_bytes=jpg_bytes,
         feature_bytes=None,
         license_bytes=None,
@@ -454,7 +632,12 @@ async def hikvision_isapi(request: Request):
         "upstream_status": upstream_result["status"],
         "upstream_error": upstream_result["error"],
         "anpr_bbox": model_bbox,
+        "matched_snow": upstream_result.get("matched_snow"),
     }
+    
+    # Добавляем данные снега в лог, если они есть
+    if "snow_data" in upstream_result:
+        log_event.update(upstream_result["snow_data"])
 
     log_path = BASE_DIR / "detections.log"
     with log_path.open("a", encoding="utf-8") as f:

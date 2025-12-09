@@ -1,0 +1,507 @@
+import json
+import os
+import io
+import threading
+import time
+from collections import deque
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from typing import Any, Deque, Dict, Optional
+
+import httpx
+from google import genai
+from PIL import Image
+
+
+# Максимальный возраст события для матчинга (секунды)
+# События старше этого возраста не будут матчиться с ANPR событиями
+# Это предотвращает матчинг старых событий от стоячих машин с новыми ANPR событиями
+MAX_EVENT_AGE_SECONDS = float(os.getenv("MERGE_MAX_EVENT_AGE_SECONDS", "15.0"))
+
+
+def _parse_iso_dt(value: str | None) -> Optional[datetime]:
+    """
+    Parse ISO8601 datetime string into aware UTC datetime.
+    Accepts trailing "Z" and timezone offsets like "+06:00".
+    """
+    if not value:
+        return None
+    try:
+        cleaned = str(value).strip()
+        
+        # Проверяем, нет ли дублирования timezone (например, +00:00Z или +00:00+00:00)
+        if cleaned.endswith("+00:00Z") or cleaned.endswith("-00:00Z"):
+            # Убираем дублирование: оставляем только Z
+            cleaned = cleaned[:-6] + "Z"
+        elif "+00:00+00:00" in cleaned or "-00:00+00:00" in cleaned:
+            # Убираем дублирование timezone
+            cleaned = cleaned.replace("+00:00+00:00", "+00:00").replace("-00:00+00:00", "+00:00")
+        
+        # Если заканчивается на Z, заменяем на +00:00
+        if cleaned.endswith("Z"):
+            cleaned = cleaned[:-1] + "+00:00"
+        # Парсим ISO формат (поддерживает +06:00, -05:00 и т.д.)
+        dt = datetime.fromisoformat(cleaned)
+        # Если нет timezone, добавляем UTC
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        # Конвертируем в UTC
+        return dt.astimezone(timezone.utc)
+    except Exception as e:
+        print(f"[MERGER] ERROR parsing datetime '{value}': {e}")
+        return None
+
+
+@dataclass
+class SnowEvent:
+    event_time: datetime
+    payload: Dict[str, Any]
+    photo_bytes: bytes | None
+
+
+class EventMerger:
+    """
+    Keeps snow events in memory and merges them with ANPR events
+    when the plate camera webhook arrives (snow -> plate order).
+    """
+
+    def __init__(
+        self,
+        upstream_url: str,
+        window_seconds: int = 30,
+        ttl_seconds: int = 60,
+    ):
+        self.upstream_url = upstream_url
+        self.window = timedelta(seconds=window_seconds)
+        self.ttl = timedelta(seconds=ttl_seconds)
+        self._snow_events: Deque[SnowEvent] = deque()
+        self._lock = threading.Lock()
+        self._gemini_client: genai.Client | None = None
+        self._gemini_api_key = os.getenv("GEMINI_API_KEY", "")
+        self._gemini_model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+        self._stop_cleanup = threading.Event()
+        self._cleanup_thread = threading.Thread(
+            target=self._cleanup_loop, daemon=True, name="merger-cleanup"
+        )
+        self._cleanup_thread.start()
+
+    def _cleanup(self, now: datetime) -> None:
+        while self._snow_events:
+            oldest = self._snow_events[0]
+            if now - oldest.event_time <= self.ttl:
+                break
+            self._snow_events.popleft()
+
+    def add_snow_event(self, payload: Dict[str, Any], photo_bytes: bytes | None) -> None:
+        event_time = (
+            _parse_iso_dt(str(payload.get("event_time")))
+            or datetime.now(tz=timezone.utc)
+        )
+        snow_payload = dict(payload)
+        snow_payload["event_time"] = event_time.isoformat()
+        with self._lock:
+            self._cleanup(datetime.now(tz=timezone.utc))
+            self._snow_events.append(SnowEvent(event_time, snow_payload, photo_bytes))
+        print(
+            f"[MERGER] stored snow event at {event_time.isoformat()}, "
+            f"queue size={len(self._snow_events)}"
+        )
+
+    def _pop_match(self, anpr_time: datetime) -> Optional[SnowEvent]:
+        best_idx = None
+        best_delta = None
+
+        print(f"[MERGER] DEBUG: searching match for anpr_time={anpr_time.isoformat()}, queue_size={len(self._snow_events)}, window={self.window.total_seconds()}s")
+        
+        for idx, snow_event in enumerate(self._snow_events):
+            delta = anpr_time - snow_event.event_time
+            delta_seconds = delta.total_seconds()
+            print(f"[MERGER] DEBUG: snow[{idx}] time={snow_event.event_time.isoformat()}, delta={delta_seconds:.1f}s")
+            
+            if delta < timedelta(0):
+                # snow should happen before plate; skip future events
+                print(f"[MERGER] DEBUG: snow[{idx}] is in future, skipping")
+                continue
+            if delta <= self.window:
+                # Дополнительная проверка: событие не должно быть слишком старым
+                # Это предотвращает матчинг старых событий от стоячих машин с новыми ANPR событиями
+                if delta.total_seconds() > MAX_EVENT_AGE_SECONDS:
+                    print(f"[MERGER] DEBUG: snow[{idx}] too old ({delta_seconds:.1f}s > {MAX_EVENT_AGE_SECONDS}s), skipping (likely stationary truck)")
+                    continue
+                if best_delta is None or delta < best_delta:
+                    best_delta = delta
+                    best_idx = idx
+                    print(f"[MERGER] DEBUG: snow[{idx}] is candidate, delta={delta_seconds:.1f}s")
+            else:
+                print(f"[MERGER] DEBUG: snow[{idx}] delta={delta_seconds:.1f}s exceeds window={self.window.total_seconds()}s")
+
+        if best_idx is None:
+            print(f"[MERGER] DEBUG: no match found")
+            return None
+
+        # remove matched event
+        match = self._snow_events[best_idx]
+        del self._snow_events[best_idx]
+        print(f"[MERGER] DEBUG: matched snow[{best_idx}], delta={best_delta.total_seconds():.1f}s")
+        return match
+
+    def restore_snow_event(self, snow_event: SnowEvent) -> None:
+        """
+        Возвращает снеговое событие обратно в очередь.
+        Используется когда событие номеров не было сохранено (машины нет в базе).
+        """
+        with self._lock:
+            # Вставляем событие обратно в очередь, сохраняя порядок по времени
+            inserted = False
+            for idx, existing_event in enumerate(self._snow_events):
+                if snow_event.event_time <= existing_event.event_time:
+                    self._snow_events.insert(idx, snow_event)
+                    inserted = True
+                    break
+            if not inserted:
+                # Если событие самое новое, добавляем в конец
+                self._snow_events.append(snow_event)
+        print(
+            f"[MERGER] restored snow event at {snow_event.event_time.isoformat()}, "
+            f"queue size={len(self._snow_events)}"
+        )
+
+    def _cleanup_loop(self) -> None:
+        """
+        Периодически чистит просроченные снеговые события, даже если нет новых запросов.
+        """
+        interval = max(1, int(self.ttl.total_seconds() / 2) or 1)
+        while not self._stop_cleanup.is_set():
+            time.sleep(interval)
+            now = datetime.now(tz=timezone.utc)
+            with self._lock:
+                self._cleanup(now)
+
+    def _get_gemini_client(self) -> genai.Client:
+        if self._gemini_client is None:
+            if not self._gemini_api_key:
+                raise RuntimeError("GEMINI_API_KEY is not set")
+            self._gemini_client = genai.Client(api_key=self._gemini_api_key)
+        return self._gemini_client
+
+    def _analyze_snow_gemini(
+        self, photo_bytes: bytes, bbox: Optional[Any]
+    ) -> Dict[str, Any]:
+        """
+        Analyze truck bed fill via Gemini using in-memory JPEG bytes.
+        """
+        if not self._gemini_api_key:
+            print("[GEMINI] ERROR: GEMINI_API_KEY is not set")
+            return {"error": "GEMINI_API_KEY is not set"}
+
+        try:
+            import time as time_module
+            start_time = time_module.time()
+            
+            image = Image.open(io.BytesIO(photo_bytes)).convert("RGB")
+            original_size = (image.width, image.height)
+            print(f"[GEMINI] Starting analysis: original image size={original_size}, bbox={bbox}")
+
+            if bbox:
+                try:
+                    x1, y1, x2, y2 = map(int, bbox)
+                    padding = 20
+                    x1 = max(0, x1 - padding)
+                    y1 = max(0, y1 - padding)
+                    x2 = min(image.width, x2 + padding)
+                    y2 = min(image.height, y2 + padding)
+                    image = image.crop((x1, y1, x2, y2))
+                    print(f"[GEMINI] Cropped image: size=({image.width}, {image.height}), crop=({x1},{y1},{x2},{y2})")
+                except Exception as e:
+                    print(f"[GEMINI] WARNING: Failed to crop image: {e}")
+
+            prompt = (
+                "You see the cargo bed of a truck.\n"
+                "Focus ONLY on snow fill inside the open bed. Ignore road/roof/background.\n"
+                "Return JSON with fields:\n"
+                "- percentage: 0.0-1.0 or 0-100 for how full with snow\n"
+                "- confidence: 0.0-1.0\n\n"
+                "If no open truck bed is visible, set percentage=0 and confidence=0.\n\n"
+                "Example:\n"
+                "{\n"
+                '  \"percentage\": 0.42,\n'
+                '  \"confidence\": 0.9\n'
+                "}\n"
+            )
+            print(f"[GEMINI] Sending request to model={self._gemini_model}, prompt_length={len(prompt)} chars")
+
+            client = self._get_gemini_client()
+            response = client.models.generate_content(
+                model=self._gemini_model,
+                contents=[image, prompt],
+            )
+            
+            request_duration = time_module.time() - start_time
+            text = (response.text or "").strip()
+            print(f"[GEMINI] Response received in {request_duration:.2f}s, response_length={len(text)} chars")
+            print(f"[GEMINI] Raw response (first 200 chars): {text[:200]}")
+            
+            if not text:
+                print("[GEMINI] ERROR: Empty response from Gemini")
+                return {"error": "Empty response from Gemini"}
+
+            original_text = text
+            if text.startswith("```"):
+                text = text.strip("`")
+                if text.lower().startswith("json"):
+                    text = text[4:].strip()
+                print(f"[GEMINI] Cleaned response (removed markdown): length={len(text)} chars")
+
+            try:
+                result = json.loads(text)
+                print(f"[GEMINI] Successfully parsed JSON: {result}")
+                return result
+            except json.JSONDecodeError as e:
+                print(f"[GEMINI] ERROR: JSON parse failed: {e}")
+                print(f"[GEMINI] Failed to parse text: {text[:500]}")
+                return {"raw": original_text, "error": f"JSON parse error: {e}", "percentage": 0.0, "confidence": 0.0}
+        except Exception as e:
+            print(f"[GEMINI] EXCEPTION: {type(e).__name__}: {e}")
+            import traceback
+            print(f"[GEMINI] Traceback: {traceback.format_exc()}")
+            return {"error": str(e), "percentage": 0.0, "confidence": 0.0}
+
+    @staticmethod
+    def _extract_snow_fields(gemini_result: dict) -> tuple[Optional[float], Optional[float]]:
+        percentage = None
+        confidence = None
+        raw = None
+
+        if isinstance(gemini_result, dict):
+            percentage = gemini_result.get("percentage")
+            confidence = gemini_result.get("confidence")
+            raw = gemini_result.get("raw")
+
+        if (percentage is None or confidence is None) and raw:
+            raw_s = str(raw).strip()
+            try:
+                if raw_s.startswith("```"):
+                    raw_s = raw_s.strip("`")
+                    if raw_s.lower().startswith("json"):
+                        raw_s = raw_s[4:].strip()
+                parsed = json.loads(raw_s)
+                percentage = parsed.get("percentage") if percentage is None else percentage
+                confidence = parsed.get("confidence") if confidence is None else confidence
+            except Exception:
+                pass
+
+        try:
+            if percentage is not None:
+                val = float(percentage)
+                if 0.0 <= val <= 1.0:
+                    percentage = round(val * 100, 2)
+                elif 0 <= val <= 100:
+                    percentage = round(val, 2)
+                else:
+                    percentage = max(0.0, min(100.0, round(val, 2)))
+        except Exception:
+            percentage = None
+
+        try:
+            if confidence is not None:
+                confidence = float(confidence)
+        except Exception:
+            confidence = None
+
+        return percentage, confidence
+
+    async def combine_and_send(
+        self,
+        anpr_event: Dict[str, Any],
+        detection_bytes: bytes | None,
+        feature_bytes: bytes | None,
+        license_bytes: bytes | None,
+    ) -> Dict[str, Any]:
+        """
+        Merge ANPR event with the closest earlier snow event (within window)
+        and send a single multipart request upstream.
+        """
+        now = datetime.now(tz=timezone.utc)
+        anpr_time_str = str(anpr_event.get("event_time", ""))
+        anpr_time = _parse_iso_dt(anpr_time_str) or now
+        
+        print(f"[MERGER] DEBUG: anpr_event_time_str='{anpr_time_str}', parsed={anpr_time.isoformat()}, now={now.isoformat()}")
+
+        with self._lock:
+            self._cleanup(anpr_time)  # Используем anpr_time вместо now для корректной очистки
+            snow_event = self._pop_match(anpr_time)
+
+        combined_event = dict(anpr_event)
+        snow_analysis = None
+
+        if snow_event:
+            # Отложенный анализ: вызываем Gemini только когда есть матч с номером
+            if snow_event.photo_bytes and self._gemini_api_key:
+                print(f"[MERGER] Running Gemini analysis for matched snow event (photo_size={len(snow_event.photo_bytes)} bytes, bbox={snow_event.payload.get('bbox')})...")
+                snow_analysis = self._analyze_snow_gemini(
+                    snow_event.photo_bytes, snow_event.payload.get("bbox")
+                )
+                print(f"[MERGER] Gemini analysis result: {snow_analysis}")
+                percentage, confidence = self._extract_snow_fields(snow_analysis)
+                print(f"[MERGER] Extracted snow fields: percentage={percentage}, confidence={confidence}")
+            else:
+                if not snow_event.photo_bytes:
+                    print("[MERGER] WARNING: snow_event.photo_bytes is None or empty")
+                if not self._gemini_api_key:
+                    print("[MERGER] WARNING: GEMINI_API_KEY is not set")
+                percentage, confidence = 0.0, 0.0
+
+            combined_event.update(
+                {
+                    "snow_volume_percentage": percentage if percentage is not None else 0.0,
+                    "snow_volume_confidence": confidence if confidence is not None else 0.0,
+                    "matched_snow": True,
+                }
+            )
+            print(f"[MERGER] Final combined event snow fields: percentage={combined_event.get('snow_volume_percentage')}, confidence={combined_event.get('snow_volume_confidence')}")
+            if snow_analysis is not None:
+                combined_event["snow_gemini_raw"] = snow_analysis
+        else:
+            # Всегда заполняем поля о снеге, даже если снег не найден
+            combined_event.update(
+                {
+                    "snow_volume_percentage": 0.0,
+                    "snow_volume_confidence": 0.0,
+                    "matched_snow": False,
+                }
+            )
+
+        # Логируем номер и формат времени перед отправкой
+        plate_value = combined_event.get("plate", "N/A")
+        event_time_value = combined_event.get("event_time", "N/A")
+        print(f"[MERGER] SENDING EVENT - plate: '{plate_value}' (type: {type(plate_value).__name__})")
+        print(f"[MERGER] SENDING EVENT - event_time: '{event_time_value}' (type: {type(event_time_value).__name__})")
+        print(f"[MERGER] SENDING EVENT - full JSON keys: {list(combined_event.keys())}")
+        
+        # Проверяем обязательные поля
+        required_fields = ["camera_id", "event_time", "plate", "confidence", "direction", "lane", "vehicle"]
+        missing_fields = [f for f in required_fields if f not in combined_event]
+        if missing_fields:
+            print(f"[MERGER] WARNING: missing required fields: {missing_fields}")
+        
+        data = {"event": json.dumps(combined_event, ensure_ascii=False)}
+        
+        files = []
+
+        if detection_bytes:
+            files.append(
+                ("photos", ("detectionPicture.jpg", detection_bytes, "image/jpeg"))
+            )
+        if feature_bytes:
+            files.append(
+                ("photos", ("featurePicture.jpg", feature_bytes, "image/jpeg"))
+            )
+        if license_bytes:
+            files.append(
+                ("photos", ("licensePlatePicture.jpg", license_bytes, "image/jpeg"))
+            )
+        if snow_event and snow_event.photo_bytes:
+            files.append(
+                ("photos", ("snowSnapshot.jpg", snow_event.photo_bytes, "image/jpeg"))
+            )
+
+        result = {
+            "sent": False,
+            "status": None,
+            "error": None,
+            "matched_snow": bool(snow_event),
+        }
+        
+        # Добавляем данные снега в результат для логирования
+        if snow_event:
+            result["snow_data"] = {
+                "snow_volume_percentage": snow_event.payload.get("snow_volume_percentage"),
+                "snow_volume_confidence": snow_event.payload.get("snow_volume_confidence"),
+            }
+            if "snow_gemini_raw" in snow_event.payload:
+                result["snow_data"]["snow_gemini_raw"] = snow_event.payload["snow_gemini_raw"]
+
+        if not self.upstream_url:
+            result["error"] = "UPSTREAM_URL is empty"
+            print(f"[MERGER] {result['error']}")
+            return result
+
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                # Если есть файлы - отправляем multipart/form-data
+                # Если файлов нет - отправляем как JSON (application/json)
+                if files:
+                    print(f"[MERGER] sending multipart request with {len(files)} files")
+                    print(f"[MERGER] multipart data keys: {list(data.keys())}")
+                    resp = await client.post(
+                        self.upstream_url,
+                        data=data,
+                        files=files,
+                    )
+                else:
+                    # Нет файлов - отправляем как JSON
+                    print(f"[MERGER] sending JSON request (no files)")
+                    print(f"[MERGER] JSON payload size: {len(json.dumps(combined_event, ensure_ascii=False))} bytes")
+                    resp = await client.post(
+                        self.upstream_url,
+                        json=combined_event,
+                        headers={"Content-Type": "application/json"},
+                    )
+            result["sent"] = resp.is_success
+            result["status"] = resp.status_code
+            
+            # Парсим ответ от anpr-service чтобы узнать, была ли машина найдена
+            vehicle_exists = None
+            if resp.is_success and resp.status_code == 201:
+                try:
+                    response_json = resp.json()
+                    vehicle_exists = response_json.get("vehicle_exists", None)
+                except Exception:
+                    pass  # Не критично, если не удалось распарсить
+            
+            # Если машины нет в базе (vehicle_exists = false), возвращаем снеговое событие обратно в очередь
+            if snow_event and vehicle_exists is False:
+                self.restore_snow_event(snow_event)
+                print(
+                    f"[MERGER] vehicle not found in database, restored snow event to queue"
+                )
+            
+            if not resp.is_success:
+                error_text = resp.text[:400] if resp.text else "No error message"
+                result["error"] = error_text
+                print(f"[MERGER] ERROR from upstream: status={resp.status_code}, error={error_text}")
+            print(
+                f"[MERGER] upstream sent={result['sent']} "
+                f"status={result['status']} matched_snow={result['matched_snow']} "
+                f"vehicle_exists={vehicle_exists}"
+            )
+        except Exception as e:
+            result["error"] = str(e)
+            print(f"[MERGER] error while sending event: {e}")
+            # При ошибке тоже возвращаем событие снега обратно, чтобы не потерять данные
+            if snow_event:
+                self.restore_snow_event(snow_event)
+                print(f"[MERGER] error occurred, restored snow event to queue")
+
+        return result
+
+
+_merger_instance: EventMerger | None = None
+
+
+def init_merger(
+    upstream_url: str,
+    window_seconds: int = 30,
+    ttl_seconds: int = 60,
+) -> EventMerger:
+    """
+    Initialize (or return existing) EventMerger singleton.
+    """
+    global _merger_instance
+    if _merger_instance is None:
+        _merger_instance = EventMerger(
+            upstream_url=upstream_url,
+            window_seconds=window_seconds,
+            ttl_seconds=ttl_seconds,
+        )
+    return _merger_instance

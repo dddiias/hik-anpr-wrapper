@@ -1,106 +1,96 @@
-# Hikvision ANPR Wrapper
+# Unified ANPR + Snow Service (RU)
 
-FastAPI‑сервис, который принимает события от камер Hikvision, прогоняет изображение через свою модель распознавания номерных знаков (YOLOv8 + PaddleOCR) и при необходимости пересылает событие в другой сервис в виде `multipart/form-data`.
+Сервис объединяет события двух камер: номерной (Hikvision ANPR) и снеговой (RTSP). Поток такой: снеговая камера кладёт кадры в память, при приходе ANPR вебхука ищется предыдущее снеговое событие в окне, вызывается Gemini для оценки заполненности кузова и отправляется единый multipart на внешний сервис.
 
-## Что внутри
-- `api.py` — HTTP API: `GET /health`, `POST /anpr`, `POST /api/v1/anpr/hikvision`.
-- `modules/anpr.ANPR` — пайплайн: детекция номера YOLOv8 (`runs/detect/train4/weights/best.pt`), препроцессинг кадра, OCR (PaddleOCR), нормализация под номера РК (`limitations/plate_rules.py`).
-- `modules/detector.PlateDetector` — обертка над YOLO для детекции номера без OCR.
-- Входные артефакты камер складываются в `hik_raws/<YYYY-MM-DD>/parts` (XML) и `hik_raws/<YYYY-MM-DD>/images` (зарезервировано), логи отправок — `hik_raws/detections.log`.
+## Архитектура и потоки
+- `api.py` (FastAPI): эндпоинты `GET /health`, `POST /anpr`, `POST /api/v1/anpr/hikvision`. Загружает модели ANPR, по старту может включить снежный воркер.
+- `snow_worker.py`: фон, читает RTSP, детектит грузовики (YOLO), при движении в зоне сохраняет кадр в памяти и кладёт в очередь мерджера (без диска, без Gemini).
+- `combined_merger.py`: хранит снеговые события в памяти (TTL + окно), при ANPR событии берёт ближайшее предыдущее снеговое, только тогда вызывает Gemini (если есть ключ) и шлёт единый multipart на `UPSTREAM_URL`.
+- `modules/anpr.py`: детектор номера (YOLO) + OCR (PaddleOCR) + нормализация KZ шаблонов.
 
-## Установка
-Требуется Python 3.11.8.
+### Логика снег → номер
+1) Воркер видит грузовик в центральной зоне, движение слева направо → кодирует кадр в JPEG, кладёт в очередь с `event_time`/`bbox` (без Gemini).
+2) При ANPR вебхуке мерджер ищет предыдущее снеговое в окне `MERGE_WINDOW_SECONDS` (snow раньше, plate позже). Просроченные (`MERGE_TTL_SECONDS`) удаляются.
+3) Если найдено: вызывает Gemini по `snowSnapshot` (обрезает по bbox), заполняет `snow_volume_percentage/confidence`, прикладывает `snowSnapshot.jpg`, `matched_snow=true`.
+4) Если не найдено или нет ключа Gemini: ставит нули, `matched_snow` остаётся по факту наличия матча; снимок снега прикладывается только при матче.
+5) События без валидного номера/уверенности пропускаются.
+
+### Логика ANPR вебхука
+- Путь 1 (multipart Hikvision): парсит `anpr.xml` (номер/время/уверенность), кадр `detectionPicture.jpg` прогоняется через свою модель. Если нет валидного номера/уверенности — пропуск. Если модель/камера не вернули номер, подставляется хардкод `747AO`, иначе отправляется реальный.
+- Путь 2 (fallback JPEG в body): только модель ANPR. Аналогично: при отсутствии валидного номера/уверенности — пропуск; хардкод ставится только если модель не дала номер.
+- Все события/пропуски пишутся в `hik_raws/detections.log`.
+
+## Переменные окружения (`.env` пример)
+```
+UPSTREAM_URL=https://snowops-anpr-service.onrender.com/api/v1/anpr/events
+PLATE_CAMERA_ID=camera-001
+
+# merge timing
+MERGE_WINDOW_SECONDS=30
+MERGE_TTL_SECONDS=60
+
+# snow worker
+ENABLE_SNOW_WORKER=true
+SNOW_VIDEO_SOURCE_URL=rtsp://user:pass@host:port/Streaming/Channels/101
+SNOW_CAMERA_ID=camera-snow
+SNOW_YOLO_MODEL_PATH=yolov8n.pt
+SNOW_CENTER_ZONE_START_X=0.15
+SNOW_CENTER_ZONE_END_X=0.85
+SNOW_CENTER_ZONE_START_Y=0.0
+SNOW_CENTER_ZONE_END_Y=1.0
+SNOW_CENTER_LINE_X=0.5
+SNOW_MIN_DIRECTION_DELTA=5
+SNOW_STATIONARY_TIMEOUT_SECONDS=10.0
+SNOW_SHOW_WINDOW=false
+
+# merge timing (для фильтрации старых событий)
+MERGE_MAX_EVENT_AGE_SECONDS=15.0
+
+# Gemini (нужен только при мердже со снегом)
+GEMINI_API_KEY=your_key
+GEMINI_MODEL=gemini-2.5-flash
+```
+
+## Запуск
 ```bash
 python -m venv .venv
-.\.venv\Scripts\activate
+.\.venv\Scripts\activate   # или source .venv/bin/activate
 pip install --upgrade pip
 pip install -r requirements.txt
-```
-> PaddleOCR подтянет весовые файлы при первом запуске (скачивание ~200 МБ).
 
-## Запуск API
-```bash
-uvicorn api:app --host 0.0.0.0 --port 8000
+uvicorn api:app --host 0.0.0.0 --port 8000 --env-file .env
 ```
-Значение апстрима настраивается в `api.py` через константу `UPSTREAM_URL`. Если оставить пустой строкой, события наружу не отправляются, но продолжают логироваться.
+Если `ENABLE_SNOW_WORKER=true`, воркер стартует вместе с приложением. Остановка — Ctrl+C.
 
 ## Эндпоинты
-### `GET /health`
-Проверка доступности. Ответ: `{"status": "ok"}`.
+- `GET /health` → `{"status": "ok"}`
+- `POST /anpr` → `multipart/form-data` с полем `file` (JPEG/PNG), отдаёт JSON с номером.
+- `POST /api/v1/anpr/hikvision` → вебхук Hikvision (multipart с `anpr.xml` + изображениями или raw JPEG fallback). Триггерит ANPR и мердж со снегом.
 
-### `POST /anpr`
-Одно изображение на вход, распознанный номер на выходе.
-- Тело: `multipart/form-data`, поле `file` (JPEG/PNG).
-- Успешный ответ: `{"plate":"850ZEX15","det_conf":0.87,"ocr_conf":0.91,"bbox":[x1,y1,x2,y2]}`.
-- Ошибки: `400 Empty file`, `400 Cannot decode image`.
-Пример:
-```bash
-curl -X POST -F "file=@img/sample.jpg" http://localhost:8000/anpr
-```
+## Что уходит во внешний сервис (multipart на `UPSTREAM_URL`)
+- Поле `event` (строка JSON). Ключи:
+  - `camera_id` (`PLATE_CAMERA_ID`)
+  - `event_time` (из XML или сейчас, RFC3339)
+  - `plate`, `confidence`
+  - `camera_plate`, `camera_confidence` (из XML, если были)
+  - `model_plate`, `model_det_conf`, `model_ocr_conf`
+  - `direction`, `lane`, `vehicle` (заглушка `{}`)
+  - `timestamp` (время обработки)
+  - `original_plate_test` (оригинальный номер до возможного хардкода, для отладки)
+  - `matched_snow` (true/false)
+  - При матче со снегом: `snow_volume_percentage`, `snow_volume_confidence`, `snow_gemini_raw`
+  - При отсутствии матча: `snow_volume_percentage=0`, `snow_volume_confidence=0`, `matched_snow=false`
+- Поле `photos` (несколько файлов):
+  - `detectionPicture.jpg` — кадр ANPR (всегда при multipart Hikvision, при fallback — выдранный JPEG)
+  - `featurePicture.jpg` — если пришла
+  - `licensePlatePicture.jpg` — если пришла
+  - `snowSnapshot.jpg` — если было совпавшее снеговое событие
 
-### `POST /api/v1/anpr/hikvision`
-Точка приёма webhook от Hikvision. Поддерживаются два формата запроса:
-1) **Стандартный multipart от камеры.**
-   - `anpr.xml` — сохраняется в `hik_raws/<date>/parts/<time>_anpr.xml`, парсятся поля `licensePlate`/`originalLicensePlate`, `confidenceLevel`, `eventType`, `dateTime`.
-   - `detectionPicture.jpg` — используется как основное изображение для своей ANPR-модели.
-   - `featurePicture.jpg`, `licensePlatePicture.jpg` — дополнительные кадры, просто пробрасываются дальше.
-   - Любые текстовые поля формы печатаются в лог (stdout).
-2) **Fallback: JPEG прямо в теле** (для случаев без multipart). Из тела вырезается первый JPEG, остальной контент игнорируется.
+## Данные и логи
+- Логи вебхуков ANPR: `hik_raws/detections.log`
+- Снимки снега на диск не пишутся (всё в памяти).
 
-Общий поток обработки:
-1. Если пришёл `detectionPicture.jpg`, запускается `ANPR.infer()`; без него модель не вызывается.
-2. Формируется `event_data`:
-   - `camera_id` — всегда `"camera-001"` (зашито, при необходимости поменяйте в `api.py`).
-   - `event_time` — `dateTime` из XML, иначе текущее время.
-   - `plate` — приоритетно модель (`model_plate`), иначе номер из камеры.
-   - `camera_plate`, `camera_confidence` — из XML; могут быть `null`.
-   - `model_plate`, `model_det_conf`, `model_ocr_conf` — из собственной модели; `null`, если модель не запускалась.
-   - `timestamp` — текущее время формирования события.
-3. Событие отправляется в апстрим (`send_to_upstream`), результат фиксируется в `hik_raws/detections.log` вместе со статусом отправки (`upstream_sent`, `upstream_status`, `upstream_error`). В fallback‑режиме в лог дополнительно пишется `anpr_bbox`.
-4. Ответ сервиса — `{"status": "ok"}`. Если JPEG не извлечён из тела — тоже `ok` (ничего не отправляется). При невозможности декодировать JPEG — `{"status":"error","message":"cannot decode jpeg"}` с кодом 400.
-
-Пример запроса отлаженного multipart:
-```bash
-curl -X POST http://localhost:8000/api/v1/anpr/hikvision ^
-  -F "anpr.xml=@hik_raws/2025-12-06/parts/sample_anpr.xml;type=text/xml" ^
-  -F "detectionPicture.jpg=@img/sample.jpg;type=image/jpeg" ^
-  -F "featurePicture.jpg=@img/sample.jpg;type=image/jpeg"
-```
-
-## Формат отправки в внешний сервис
-`send_to_upstream` делает `POST {UPSTREAM_URL}` с `multipart/form-data`:
-- Поле `event` — строка JSON с вышеописанной структурой `event_data`.
-- Поле (повторяющееся) `photos` — JPEG-файлы:
-  - `detectionPicture.jpg` — основное изображение (если было в запросе, либо JPEG из тела при fallback).
-  - `featurePicture.jpg` — если камера прислала.
-  - `licensePlatePicture.jpg` — если камера прислала.
-
-Пример полезной нагрузки `event` при multipart:
-```json
-{
-  "camera_id": "camera-001",
-  "event_time": "2025-12-06T15:20:18",
-  "plate": "850ZEX15",
-  "camera_plate": "850ZEX15",
-  "camera_confidence": 0.83,
-  "model_plate": "850ZEX15",
-  "model_det_conf": 0.91,
-  "model_ocr_conf": 0.89,
-  "timestamp": "2025-12-06T15:20:19.123456"
-}
-```
-В fallback‑режиме `camera_plate` и `camera_confidence` будут `null`, `event_time` = текущее время, фотография — единственный `detectionPicture.jpg` из тела.
-
-## Отладочные файлы
-- `debug_raw_crop.jpg`, `debug_proc_crop.jpg` — последний raw/обработанный кроп номера из OCR.
-- `debug_no_det/` — исходные кадры, где YOLO не нашла номер.
-- `hik_raws/detections.log` — построчно JSON событий и статусов отправки.
-
-## Использование как библиотеки
-```python
-from modules.anpr import ANPR
-
-engine = ANPR()  # можно передать yolo_weights="path/to/weights.pt"
-result = engine.infer("img/sample.jpg")  # либо np.ndarray (BGR)
-print(result)  # {'plate': '850ZEX15', 'det_conf': ..., 'ocr_conf': ..., 'bbox': [...]}
-```
+## Важные нюансы
+- Очередь снега чистится по TTL при добавлении/мердже; при полном простое старые элементы останутся в памяти до следующего события.
+- При отсутствии `GEMINI_API_KEY` снеговая часть ставится в нули, но при матче `matched_snow` остаётся true и `snowSnapshot.jpg` уходит.
+- В `.env` нельзя хранить реальные ключи/RTSP в репозитории.
