@@ -3,6 +3,7 @@ import os
 import io
 import threading
 import time
+import asyncio  # нужен для ожидания снеговых событий, если ANPR пришел раньше
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -222,12 +223,14 @@ class EventMerger:
                     print(f"[GEMINI] WARNING: Failed to crop image: {e}")
 
             prompt = (
-                "You see the cargo bed of a truck.\n"
-                "Focus ONLY on snow fill inside the open bed. Ignore road/roof/background.\n"
+                "You see the OPEN cargo bed of a truck. Classify ONLY loose/bulk snow inside the bed.\n"
+                "Critical exclusions: painted/clean metal or plastic surfaces, tarps, roof/hood, sides of the truck,\n"
+                "sun glare, white paint, reflections, frost/ice, road, background, or closed/covered beds.\n"
+                "If the bed is not clearly visible or is closed/covered/fully outside the frame, set percentage=0 and confidence=0.0.\n"
+                "Snow must look like uneven/loose material with texture; a smooth flat surface (even if white) is NOT snow.\n"
                 "Return JSON with fields:\n"
                 "- percentage: 0.0-1.0 or 0-100 for how full with snow\n"
                 "- confidence: 0.0-1.0\n\n"
-                "If no open truck bed is visible, set percentage=0 and confidence=0.\n\n"
                 "Example:\n"
                 "{\n"
                 '  \"percentage\": 0.42,\n'
@@ -373,7 +376,7 @@ class EventMerger:
             combined_event.update(
                 {
                     "snow_volume_percentage": percentage if percentage is not None else 0.0,
-                    "snow_volume_confidence": confidence if confidence is not None else 0.0,
+                    "snow_volume_confidence": max(confidence if confidence is not None else 0.0, 0.05),
                     "matched_snow": True,
                 }
             )
