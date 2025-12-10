@@ -26,7 +26,9 @@ CENTER_ZONE_END_Y = float(os.getenv("SNOW_CENTER_ZONE_END_Y", "1.0"))  # Кон�
 CENTER_LINE_X = float(os.getenv("SNOW_CENTER_LINE_X", "0.5"))
 MIN_DIRECTION_DELTA = int(os.getenv("SNOW_MIN_DIRECTION_DELTA", "5"))
 MISS_RESET_THRESHOLD_ENV = int(os.getenv("SNOW_MISS_RESET_THRESHOLD", "3"))
-STATIONARY_TIMEOUT_SECONDS = float(os.getenv("SNOW_STATIONARY_TIMEOUT_SECONDS", "10.0"))  # Если машина стоит > N сек, не добавлять событие
+STATIONARY_TIMEOUT_SECONDS = float(os.getenv("SNOW_STATIONARY_TIMEOUT_SECONDS", "10.0"))  # Если машина стоит > N сек, сбрасываем трекинг
+R2L_CONFIRM_THRESHOLD = int(os.getenv("SNOW_R2L_CONFIRM_THRESHOLD", "5"))  # После N подтверждений R→L игнорируем машину
+STATIONARY_HARD_TIMEOUT_SECONDS = float(os.getenv("SNOW_STATIONARY_HARD_TIMEOUT_SECONDS", "60.0"))  # После 1 минуты стоянки игнорируем машину
 
 SHOW_WINDOW = os.getenv("SNOW_SHOW_WINDOW", "false").lower() == "true"
 
@@ -38,10 +40,11 @@ _stop_event = threading.Event()
 
 def _detect_truck_bbox(frame: np.ndarray, model: YOLO) -> Optional[Tuple[int, int, int, int]]:
     """
-    Находит bbox грузовика (class=TRUCK_CLASS_ID) с максимальной площадью.
+    Находит bbox грузовика (class=TRUCK_CLASS_ID) с приоритетом ближе к камере.
+    Приоритет: больший y2 (ниже в кадре) + площадь.
     """
     best_box = None
-    best_area = 0.0
+    best_score = -1.0
 
     results = model(frame, verbose=False)
     for r in results:
@@ -55,8 +58,10 @@ def _detect_truck_bbox(frame: np.ndarray, model: YOLO) -> Optional[Tuple[int, in
                 continue
             x1, y1, x2, y2 = map(int, b.xyxy[0].tolist())
             area = (x2 - x1) * (y2 - y1)
-            if area > best_area:
-                best_area = area
+            # Чем ниже y2 (ближе к камере) и чем больше площадь, тем выше score
+            score = y2 * 1.0 + area * 0.001
+            if score > best_score:
+                best_score = score
                 best_box = (x1, y1, x2, y2)
     return best_box
 
@@ -125,6 +130,8 @@ def _snow_loop(upstream_url: str):
     last_movement_time = None  # Время последнего значимого движения
     last_truck_bbox = None  # Последний bbox для отслеживания смены машины
     last_truck_was_r_to_l = False  # Флаг: последняя машина двигалась справа налево (сохраняется между кадрами)
+    r2l_confirmations = 0  # Сколько раз подряд подтвердили движение R→L для текущей машины
+    ignore_current_truck = False  # Флаг: игнорировать текущую машину (R→L подтверждена или стоит слишком долго)
 
     frame_width = None
     frame_height = None
@@ -202,6 +209,8 @@ def _snow_loop(upstream_url: str):
                     event_sent_for_current_truck = False
                     last_movement_time = None
                     last_truck_was_r_to_l = False  # Новая машина - сбрасываем флаг R→L
+                    r2l_confirmations = 0
+                    ignore_current_truck = False
             
             # Логируем состояние для диагностики (только при детекции)
             # Не логируем если машина стоит слишком долго (чтобы не спамить)
@@ -222,34 +231,42 @@ def _snow_loop(upstream_url: str):
             # Проверяем направление движения
             moving_right = _is_moving_left_to_right(center_x_obj, last_center_x)
             
-            # Отслеживаем, было ли движение справа налево в текущем кадре
-            # Это нужно, чтобы не добавлять события для машин, движущихся R→L
+            # Отслеживаем, было ли движение справа налево в текущем кадре.
+            # При множественных подтверждениях R→L игнорируем эту машину, пока она не пропадет из кадра.
             current_frame_r_to_l = False
             if last_center_x is not None:
                 delta = center_x_obj - last_center_x
                 if delta < -MIN_DIRECTION_DELTA:  # Движение справа налево
                     current_frame_r_to_l = True
                     last_truck_was_r_to_l = True  # Сохраняем флаг для следующих кадров
+                    r2l_confirmations += 1
+                    if r2l_confirmations >= R2L_CONFIRM_THRESHOLD:
+                        ignore_current_truck = True
+                        print(f"[SNOW] confirmed R→L {r2l_confirmations} times (>= {R2L_CONFIRM_THRESHOLD}), ignoring this truck until it leaves")
+                elif delta > MIN_DIRECTION_DELTA:
+                    # Движение в нужную сторону сбрасывает подтверждения R→L
+                    r2l_confirmations = 0
             
             # Сохраняем флаг первого обнаружения ДО установки last_center_x
             is_first_detection = (last_center_x is None and in_zone)
             is_first_in_left_half = (is_first_detection and 
                                      center_x_obj < (zone_start_px + zone_end_px) // 2)
             
-            # Если это первое обнаружение в зоне - сохраняем позицию для следующего кадра
+            # Если это первое обнаружение в зоне - сохраняем позицию для следующего кадра.
+            # ВАЖНО: не сбрасываем флаг R→L на первом кадре, чтобы не пропускать
+            # последовательное движение справа-налево.
             if is_first_detection:
                 last_center_x = center_x_obj
                 last_movement_time = time.time()  # Фиксируем время первого обнаружения
-                # Если это первое обнаружение и флаг R→L установлен, сбрасываем его (новая машина или машина изменила направление)
-                if last_truck_was_r_to_l:
-                    print(f"[SNOW] first detection after R→L movement, resetting R→L flag (center_x={center_x_obj:.1f}px)")
-                    last_truck_was_r_to_l = False
-                else:
-                    print(f"[SNOW] first detection in zone (center_x={center_x_obj:.1f}px), saved for direction check")
+                print(f"[SNOW] first detection in zone (center_x={center_x_obj:.1f}px), saved for direction check")
             # Если грузовик движется слева направо - обновляем позицию и время движения
             elif moving_right:
                 last_center_x = center_x_obj
                 last_movement_time = time.time()  # Обновляем время последнего движения
+                r2l_confirmations = 0
+                if ignore_current_truck:
+                    print(f"[SNOW] truck now moving left-to-right, stopping ignore (center_x={center_x_obj:.1f}px)")
+                ignore_current_truck = False
                 # Если машина движется L→R, сбрасываем флаг R→L (подтверждение правильного направления)
                 if last_truck_was_r_to_l:
                     print(f"[SNOW] truck moving left-to-right (center_x={center_x_obj:.1f}px), resetting R→L flag, tracking updated")
@@ -297,7 +314,17 @@ def _snow_loop(upstream_url: str):
             should_process_truck = True
             if not is_first_detection and last_movement_time is not None:
                 time_since_movement = time.time() - last_movement_time
-                if time_since_movement > STATIONARY_TIMEOUT_SECONDS:
+                if time_since_movement > STATIONARY_HARD_TIMEOUT_SECONDS:
+                    print(f"[SNOW] truck stationary too long ({time_since_movement:.1f}s > {STATIONARY_HARD_TIMEOUT_SECONDS}s), ignoring this truck until it leaves")
+                    ignore_current_truck = True
+                    last_center_x = None
+                    event_sent_for_current_truck = False
+                    last_movement_time = None
+                    last_truck_bbox = None
+                    last_truck_was_r_to_l = False
+                    r2l_confirmations = 0
+                    should_process_truck = False
+                elif time_since_movement > STATIONARY_TIMEOUT_SECONDS:
                     # Сбрасываем трекинг для стоячей машины, чтобы не логировать постоянно
                     # и чтобы система могла начать отслеживать новую машину
                     print(f"[SNOW] truck stationary too long ({time_since_movement:.1f}s > {STATIONARY_TIMEOUT_SECONDS}s), resetting tracking")
@@ -306,6 +333,7 @@ def _snow_loop(upstream_url: str):
                     last_movement_time = None
                     last_truck_bbox = None
                     last_truck_was_r_to_l = False  # Стоячая машина - сбрасываем флаг R→L
+                    r2l_confirmations = 0
                     should_process_truck = False  # Пропускаем дальнейшую обработку для этой стоячей машины
             
             # Обрабатываем только если машина не стоит слишком долго
@@ -318,6 +346,7 @@ def _snow_loop(upstream_url: str):
                     and (moving_right or is_first_on_left_side)
                     and not current_frame_r_to_l
                     and not last_truck_was_r_to_l
+                    and not ignore_current_truck
                 )
                 
                 # Подробное логирование для диагностики (только если не первое обнаружение или есть движение)
@@ -377,6 +406,8 @@ def _snow_loop(upstream_url: str):
                 last_movement_time = None
                 last_truck_bbox = None
                 last_truck_was_r_to_l = False  # Машина покинула зону - сбрасываем флаг R→L
+                r2l_confirmations = 0
+                ignore_current_truck = False
         else:
             # Грузовик не детектирован - даем небольшой допуск на пропуски
             miss_count += 1
@@ -388,6 +419,8 @@ def _snow_loop(upstream_url: str):
                 last_movement_time = None
                 last_truck_bbox = None
                 last_truck_was_r_to_l = False  # Машина не детектируется - сбрасываем флаг R→L
+                r2l_confirmations = 0
+                ignore_current_truck = False
                 miss_count = 0
             # Небольшая пауза, чтобы не крутить цикл слишком быстро при пропусках
             time.sleep(0.02)

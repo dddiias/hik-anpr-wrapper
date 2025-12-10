@@ -17,6 +17,14 @@ from PIL import Image
 # События старше этого возраста не будут матчиться с ANPR событиями
 # Это предотвращает матчинг старых событий от стоячих машин с новыми ANPR событиями
 MAX_EVENT_AGE_SECONDS = float(os.getenv("MERGE_MAX_EVENT_AGE_SECONDS", "15.0"))
+# Сколько секунд максимум ждать прихода парного события снега, если ANPR пришел раньше.
+# По умолчанию равно MERGE_WINDOW_SECONDS (если задан), иначе 20.
+WAIT_FOR_SNOW_SECONDS = float(
+    os.getenv(
+        "MERGE_WAIT_FOR_SNOW_SECONDS",
+        os.getenv("MERGE_WINDOW_SECONDS", "20")
+    )
+)
 
 
 def _parse_iso_dt(value: str | None) -> Optional[datetime]:
@@ -116,24 +124,22 @@ class EventMerger:
         for idx, snow_event in enumerate(self._snow_events):
             delta = anpr_time - snow_event.event_time
             delta_seconds = delta.total_seconds()
-            print(f"[MERGER] DEBUG: snow[{idx}] time={snow_event.event_time.isoformat()}, delta={delta_seconds:.1f}s")
+            delta_abs = abs(delta)
+            delta_abs_sec = delta_abs.total_seconds()
+            print(f"[MERGER] DEBUG: snow[{idx}] time={snow_event.event_time.isoformat()}, delta={delta_seconds:.1f}s, |delta|={delta_abs_sec:.1f}s")
             
-            if delta < timedelta(0):
-                # snow should happen before plate; skip future events
-                print(f"[MERGER] DEBUG: snow[{idx}] is in future, skipping")
-                continue
-            if delta <= self.window:
-                # Дополнительная проверка: событие не должно быть слишком старым
-                # Это предотвращает матчинг старых событий от стоячих машин с новыми ANPR событиями
-                if delta.total_seconds() > MAX_EVENT_AGE_SECONDS:
-                    print(f"[MERGER] DEBUG: snow[{idx}] too old ({delta_seconds:.1f}s > {MAX_EVENT_AGE_SECONDS}s), skipping (likely stationary truck)")
+            # Матчим по модулю, чтобы не терять случаи, когда ANPR-время чуть раньше
+            if delta_abs <= self.window:
+                # Ограничиваем максимальный разрыв по модулю (защита от старых/будущих событий стоячих машин)
+                if delta_abs_sec > MAX_EVENT_AGE_SECONDS:
+                    print(f"[MERGER] DEBUG: snow[{idx}] |delta|={delta_abs_sec:.1f}s > MAX_EVENT_AGE_SECONDS={MAX_EVENT_AGE_SECONDS}s, skipping")
                     continue
-                if best_delta is None or delta < best_delta:
-                    best_delta = delta
+                if best_delta is None or delta_abs < best_delta:
+                    best_delta = delta_abs
                     best_idx = idx
-                    print(f"[MERGER] DEBUG: snow[{idx}] is candidate, delta={delta_seconds:.1f}s")
+                    print(f"[MERGER] DEBUG: snow[{idx}] is candidate, |delta|={delta_abs_sec:.1f}s (raw delta={delta_seconds:.1f}s)")
             else:
-                print(f"[MERGER] DEBUG: snow[{idx}] delta={delta_seconds:.1f}s exceeds window={self.window.total_seconds()}s")
+                print(f"[MERGER] DEBUG: snow[{idx}] |delta|={delta_abs_sec:.1f}s exceeds window={self.window.total_seconds()}s")
 
         if best_idx is None:
             print(f"[MERGER] DEBUG: no match found")
@@ -330,6 +336,19 @@ class EventMerger:
         with self._lock:
             self._cleanup(anpr_time)  # Используем anpr_time вместо now для корректной очистки
             snow_event = self._pop_match(anpr_time)
+
+        # Если снег еще не пришел, и разрешено подождать — ждём до заданного таймаута
+        if snow_event is None and WAIT_FOR_SNOW_SECONDS > 0:
+            wait_deadline = datetime.now(tz=timezone.utc) + timedelta(seconds=min(WAIT_FOR_SNOW_SECONDS, self.window.total_seconds()))
+            print(f"[MERGER] no snow match yet, waiting up to { (wait_deadline - datetime.now(tz=timezone.utc)).total_seconds():.1f}s for late snow...")
+            while datetime.now(tz=timezone.utc) < wait_deadline:
+                await asyncio.sleep(0.2)
+                with self._lock:
+                    self._cleanup(anpr_time)
+                    snow_event = self._pop_match(anpr_time)
+                if snow_event:
+                    print("[MERGER] found late snow match while waiting")
+                    break
 
         combined_event = dict(anpr_event)
         snow_analysis = None
