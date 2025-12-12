@@ -35,12 +35,27 @@ MISS_RESET_THRESHOLD_ENV = int(os.getenv("SNOW_MISS_RESET_THRESHOLD", "3"))
 STATIONARY_TIMEOUT_SECONDS = float(os.getenv("SNOW_STATIONARY_TIMEOUT_SECONDS", "10.0"))  # Если машина стоит > N сек, сбрасываем трекинг
 R2L_CONFIRM_THRESHOLD = int(os.getenv("SNOW_R2L_CONFIRM_THRESHOLD", "5"))  # После N подтверждений R→L игнорируем машину
 STATIONARY_HARD_TIMEOUT_SECONDS = float(os.getenv("SNOW_STATIONARY_HARD_TIMEOUT_SECONDS", "60.0"))  # После 1 минуты стоянки игнорируем машину
-LEAVE_RESET_THRESHOLD = int(os.getenv("SNOW_LEAVE_RESET_THRESHOLD", "12"))  # Сколько кадров подряд без детекта считать, что машина ушла
+LEAVE_RESET_THRESHOLD = int(os.getenv("SNOW_LEAVE_RESET_THRESHOLD", "18"))  # Сколько кадров подряд без детекта считать, что машина ушла
+SNOW_STREAM_DELAY_SECONDS = float(os.getenv("SNOW_STREAM_DELAY_SECONDS", "3.0"))  # Задержка RTSP потока снега
 
 SHOW_WINDOW = os.getenv("SNOW_SHOW_WINDOW", "false").lower() == "true"
 
 _snow_thread: threading.Thread | None = None
 _stop_event = threading.Event()
+
+# ===== Троттлинг повторяющихся логов, чтобы не спамить =====
+_LOG_THROTTLE_STATE: dict[str, float] = {}
+
+
+def log_throttled(key: str, msg: str, interval: float = 5.0) -> None:
+    """
+    Печатает сообщение не чаще, чем раз в interval секунд для данного ключа.
+    """
+    now = time.time()
+    last = _LOG_THROTTLE_STATE.get(key, 0.0)
+    if now - last >= interval:
+        _LOG_THROTTLE_STATE[key] = now
+        print(msg)
 
 
 # === Вспомогательные функции из старого снежного сервиса ===
@@ -281,7 +296,10 @@ def _snow_loop(upstream_url: str):
                     r2l_confirmations += 1
                     if r2l_confirmations >= R2L_CONFIRM_THRESHOLD:
                         ignore_current_truck = True
-                        print(f"[SNOW] confirmed R→L {r2l_confirmations} times (>= {R2L_CONFIRM_THRESHOLD}), ignoring this truck until it leaves")
+                        log_throttled(
+                            "confirm_r2l",
+                            f"[SNOW] confirmed R→L {r2l_confirmations} times (>= {R2L_CONFIRM_THRESHOLD}), ignoring this truck until it leaves",
+                        )
                 elif delta > MIN_DIRECTION_DELTA:
                     # Движение в нужную сторону сбрасывает подтверждения R→L
                     r2l_confirmations = 0
@@ -304,26 +322,41 @@ def _snow_loop(upstream_url: str):
                 last_movement_time = time.time()  # Обновляем время последнего движения
                 r2l_confirmations = 0
                 if ignore_current_truck:
-                    print(f"[SNOW] truck now moving left-to-right, stopping ignore (center_x={center_x_obj:.1f}px)")
+                    log_throttled(
+                        "move_l2r_ignore",
+                        f"[SNOW] truck now moving left-to-right, stopping ignore (center_x={center_x_obj:.1f}px)",
+                    )
                 ignore_current_truck = False
                 # Если машина движется L→R, сбрасываем флаг R→L (подтверждение правильного направления)
                 if last_truck_was_r_to_l:
-                    print(f"[SNOW] truck moving left-to-right (center_x={center_x_obj:.1f}px), resetting R→L flag, tracking updated")
+                    log_throttled(
+                        "move_l2r_reset",
+                        f"[SNOW] truck moving left-to-right (center_x={center_x_obj:.1f}px), resetting R→L flag, tracking updated",
+                    )
                     last_truck_was_r_to_l = False
                 else:
-                    print(f"[SNOW] truck moving left-to-right (center_x={center_x_obj:.1f}px), tracking updated")
+                    log_throttled(
+                        "move_l2r",
+                        f"[SNOW] truck moving left-to-right (center_x={center_x_obj:.1f}px), tracking updated",
+                    )
             # Если грузовик движется справа налево - сбрасываем отслеживание
             elif last_center_x is not None:
                 delta = center_x_obj - last_center_x
                 if delta < -MIN_DIRECTION_DELTA:  # Движение справа налево
-                    print(f"[SNOW] truck moving right-to-left (delta={delta:.1f}px), resetting tracking, setting R→L flag")
+                    log_throttled(
+                        "move_r2l",
+                        f"[SNOW] truck moving right-to-left (delta={delta:.1f}px), resetting tracking, setting R→L flag",
+                    )
                     last_center_x = None
                     event_sent_for_current_truck = False
                     last_movement_time = None
                     last_truck_was_r_to_l = True  # Сохраняем флаг R→L для следующих кадров
                 elif abs(delta) <= MIN_DIRECTION_DELTA:
                     # Грузовик стоит на месте или движется очень медленно
-                    print(f"[SNOW] truck stationary or slow (delta={delta:.1f}px), keeping position")
+                    log_throttled(
+                        "stationary",
+                        f"[SNOW] truck stationary or slow (delta={delta:.1f}px), keeping position",
+                    )
                     # Не обновляем last_movement_time - машина стоит
 
             # Всегда рисуем квадратик на frame для логирования (даже если окно не показывается)
@@ -388,7 +421,7 @@ def _snow_loop(upstream_url: str):
                     and not current_frame_r_to_l
                     and not last_truck_was_r_to_l
                     and not ignore_current_truck
-                    and in_middle_zone  # триггерим фото, когда грузовик в центральной полосе зоны
+                    # ослабляем: не требуем in_middle_zone, достаточно попадания в зону и L->R
                 )
                 
                 # Подробное логирование для диагностики (только если не первое обнаружение или есть движение)
@@ -435,7 +468,10 @@ def _snow_loop(upstream_url: str):
                     # Грузовик в зоне, но направление еще не подтверждено
                     # Логируем только если прошло меньше 2 секунд с последнего движения (чтобы не спамить)
                     if last_movement_time is None or (time.time() - last_movement_time) < 2.0:
-                        print(f"[SNOW] truck in zone, waiting for direction confirmation (center_x={center_x_obj:.1f}px, last={last_center_x:.1f}px)")
+                        log_throttled(
+                            "wait_dir",
+                            f"[SNOW] truck in zone, waiting for direction confirmation (center_x={center_x_obj:.1f}px, last={last_center_x:.1f}px)",
+                        )
                     last_truck_bbox = bbox  # Обновляем bbox даже если событие не добавлено
             elif not in_zone:
                 # Грузовик детектирован, но не в зоне - сбрасываем состояние для следующей машины

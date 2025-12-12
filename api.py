@@ -2,6 +2,7 @@ from typing import Any, Dict
 import os
 import pathlib
 import datetime
+from datetime import timezone
 import json
 import xml.etree.ElementTree as ET
 
@@ -359,17 +360,34 @@ async def hikvision_isapi(request: Request):
         camera_plate = camera_info.get("plate")
         camera_conf = camera_info.get("confidence")
         
-        # Парсим event_time из камеры или используем текущее время
+        # Парсим event_time из камеры или используем текущее время (UTC)
         event_time_str = camera_info.get("date_time")
-        if event_time_str:
-            # Пытаемся распарсить время от камеры
+
+        def _to_utc_iso(value: str, fallback: str) -> str:
             try:
-                # Если камера отправляет без timezone, добавляем UTC
-                if 'Z' not in event_time_str and '+' not in event_time_str:
-                    event_time_str = event_time_str + 'Z'
-                event_time = event_time_str
-            except Exception:
-                event_time = now_iso
+                cleaned = str(value).strip()
+                # Убираем дублирование timezone вроде "+00:00Z"
+                if cleaned.endswith("+00:00Z") or cleaned.endswith("-00:00Z"):
+                    cleaned = cleaned[:-6] + "Z"
+                elif "+00:00+00:00" in cleaned or "-00:00+00:00" in cleaned:
+                    cleaned = cleaned.replace("+00:00+00:00", "+00:00").replace("-00:00+00:00", "+00:00")
+
+                if cleaned.endswith("Z"):
+                    cleaned = cleaned[:-1] + "+00:00"
+                elif "Z" not in cleaned and "+" not in cleaned and "-" not in cleaned[-6:]:
+                    # Нет явного часового пояса — считаем UTC
+                    cleaned = cleaned + "+00:00"
+
+                dt = datetime.datetime.fromisoformat(cleaned)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+            except Exception as e:
+                print(f"[HIK] ERROR parsing datetime '{value}': {e}")
+                return fallback
+
+        if event_time_str:
+            event_time = _to_utc_iso(event_time_str, now_iso)
         else:
             event_time = now_iso
 
