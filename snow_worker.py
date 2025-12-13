@@ -381,6 +381,8 @@ def _snow_loop(upstream_url: str):
             if should_process_truck:
                 # НЕ добавляем событие, если машина движется справа налево
                 # Даже если это "первое обнаружение в левой части", если мы видели движение R→L, это не заезд
+                # Смягчаем условие: если машина в зоне и движется L→R, добавляем событие даже если не в строгой средней зоне
+                # Это помогает не пропускать быстрые машины
                 should_add_event = (
                     in_zone
                     and not event_sent_for_current_truck
@@ -388,19 +390,38 @@ def _snow_loop(upstream_url: str):
                     and not current_frame_r_to_l
                     and not last_truck_was_r_to_l
                     and not ignore_current_truck
-                    and in_middle_zone  # триггерим фото, когда грузовик в центральной полосе зоны
+                    and (in_middle_zone or moving_right)  # Если движется L→R, не требуем строгую среднюю зону
                 )
                 
-                # Подробное логирование для диагностики (только если не первое обнаружение или есть движение)
-                if in_zone and not event_sent_for_current_truck and (is_first_detection or moving_right):
+                # Подробное логирование для диагностики (всегда логируем, если машина в зоне и событие еще не отправлено)
+                if in_zone and not event_sent_for_current_truck:
                     print(
                         "[SNOW] DEBUG: in_zone=True, event_sent=False, "
                         f"moving_right={moving_right}, is_first_detection={is_first_detection}, "
                         f"is_first_on_left_side={is_first_on_left_side}, "
                         f"current_frame_r_to_l={current_frame_r_to_l}, last_truck_was_r_to_l={last_truck_was_r_to_l}, "
+                        f"ignore_current_truck={ignore_current_truck}, in_middle_zone={in_middle_zone}, "
                         f"center_x={center_x_obj:.1f}px, center_x_geom={center_x_geom}px, "
                         f"should_add_event={should_add_event}"
                     )
+                    if not should_add_event:
+                        # Детальная диагностика, почему событие не добавляется
+                        reasons = []
+                        if not in_zone:
+                            reasons.append("not in zone")
+                        if event_sent_for_current_truck:
+                            reasons.append("event already sent")
+                        if not (moving_right or is_first_on_left_side):
+                            reasons.append(f"not moving right (moving_right={moving_right}, is_first_on_left_side={is_first_on_left_side})")
+                        if current_frame_r_to_l:
+                            reasons.append("current frame R→L")
+                        if last_truck_was_r_to_l:
+                            reasons.append("last truck was R→L")
+                        if ignore_current_truck:
+                            reasons.append("truck ignored")
+                        if not (in_middle_zone or moving_right):
+                            reasons.append(f"not in middle zone and not moving right (in_middle_zone={in_middle_zone}, moving_right={moving_right})")
+                        print(f"[SNOW] DEBUG: event NOT added, reasons: {', '.join(reasons) if reasons else 'unknown'}")
                 
                 if should_add_event:
                     print(f"[SNOW] ===== ENCODING SNAPSHOT AND QUEUING (IN-MEMORY) ======")
@@ -428,7 +449,9 @@ def _snow_loop(upstream_url: str):
                     print(f"[SNOW] payload queued (no Gemini yet): {payload}")
 
                     merger.add_snow_event(payload, photo_bytes)
-                    print(f"[SNOW] snow event added to queue, queue_size should increase")
+                    print(f"[SNOW] snow event added to queue at {ts_saved.isoformat()}, "
+                          f"photo_size={len(photo_bytes) if photo_bytes else 0} bytes, "
+                          f"queue_size should increase")
                     event_sent_for_current_truck = True
                     last_truck_bbox = bbox  # Сохраняем bbox для отслеживания смены машины
                 elif in_zone and not moving_right and last_center_x is not None and not event_sent_for_current_truck:

@@ -102,14 +102,22 @@ class EventMerger:
             self._snow_events.popleft()
 
     def add_snow_event(self, payload: Dict[str, Any], photo_bytes: bytes | None) -> None:
-        event_time = (
-            _parse_iso_dt(str(payload.get("event_time")))
-            or datetime.now(tz=timezone.utc)
+        event_time_str = str(payload.get("event_time", ""))
+        event_time = _parse_iso_dt(event_time_str) or datetime.now(tz=timezone.utc)
+        now = datetime.now(tz=timezone.utc)
+        
+        # Логируем разницу между временем события и текущим временем для диагностики
+        time_diff = (now - event_time).total_seconds()
+        print(
+            f"[MERGER] storing snow event: event_time={event_time.isoformat()}, "
+            f"now={now.isoformat()}, time_diff={time_diff:.2f}s, "
+            f"original_str='{event_time_str}', photo_size={len(photo_bytes) if photo_bytes else 0} bytes"
         )
+        
         snow_payload = dict(payload)
         snow_payload["event_time"] = event_time.isoformat()
         with self._lock:
-            self._cleanup(datetime.now(tz=timezone.utc))
+            self._cleanup(now)
             self._snow_events.append(SnowEvent(event_time, snow_payload, photo_bytes))
         print(
             f"[MERGER] stored snow event at {event_time.isoformat()}, "
@@ -122,12 +130,34 @@ class EventMerger:
 
         print(f"[MERGER] DEBUG: searching match for anpr_time={anpr_time.isoformat()}, queue_size={len(self._snow_events)}, window={self.window.total_seconds()}s")
         
+        if len(self._snow_events) == 0:
+            print(f"[MERGER] DEBUG: queue is empty, no match possible")
+            return None
+        
+        # Логируем все события в очереди для диагностики
+        now = datetime.now(tz=timezone.utc)
+        anpr_time_diff_from_now = (anpr_time - now).total_seconds()
+        print(f"[MERGER] DEBUG: current time={now.isoformat()}, anpr_time={anpr_time.isoformat()}, "
+              f"anpr_time_diff_from_now={anpr_time_diff_from_now:.1f}s")
+        
+        # Если ANPR время сильно отличается от реального (больше чем окно), используем текущее время для матчинга
+        # Это защита от неправильно настроенных часов на камере
+        use_current_time_for_matching = abs(anpr_time_diff_from_now) > self.window.total_seconds()
+        match_time = now if use_current_time_for_matching else anpr_time
+        
+        if use_current_time_for_matching:
+            print(f"[MERGER] WARNING: ANPR time differs from current time by {abs(anpr_time_diff_from_now):.1f}s "
+                  f"(>{self.window.total_seconds()}s), using current time for matching instead of ANPR time")
+        
         for idx, snow_event in enumerate(self._snow_events):
-            delta = anpr_time - snow_event.event_time
+            age_from_now = (now - snow_event.event_time).total_seconds()
+            delta = match_time - snow_event.event_time
             delta_seconds = delta.total_seconds()
             delta_abs = abs(delta)
             delta_abs_sec = delta_abs.total_seconds()
-            print(f"[MERGER] DEBUG: snow[{idx}] time={snow_event.event_time.isoformat()}, delta={delta_seconds:.1f}s, |delta|={delta_abs_sec:.1f}s")
+            print(f"[MERGER] DEBUG: snow[{idx}] time={snow_event.event_time.isoformat()}, "
+                  f"age_from_now={age_from_now:.1f}s, delta={delta_seconds:.1f}s, |delta|={delta_abs_sec:.1f}s, "
+                  f"has_photo={snow_event.photo_bytes is not None}, match_time={match_time.isoformat()}")
             
             # Матчим по модулю, чтобы не терять случаи, когда ANPR-время чуть раньше
             if delta_abs <= self.window:
@@ -143,13 +173,26 @@ class EventMerger:
                 print(f"[MERGER] DEBUG: snow[{idx}] |delta|={delta_abs_sec:.1f}s exceeds window={self.window.total_seconds()}s")
 
         if best_idx is None:
-            print(f"[MERGER] DEBUG: no match found")
+            print(f"[MERGER] DEBUG: no match found after checking {len(self._snow_events)} events")
+            # Дополнительная диагностика: показываем ближайшее событие
+            if len(self._snow_events) > 0:
+                closest_idx = 0
+                closest_delta = abs((match_time - self._snow_events[0].event_time).total_seconds())
+                for idx, snow_event in enumerate(self._snow_events):
+                    delta_abs_sec = abs((match_time - snow_event.event_time).total_seconds())
+                    if delta_abs_sec < closest_delta:
+                        closest_delta = delta_abs_sec
+                        closest_idx = idx
+                closest_event = self._snow_events[closest_idx]
+                print(f"[MERGER] DEBUG: closest event is snow[{closest_idx}] with |delta|={closest_delta:.1f}s "
+                      f"(window={self.window.total_seconds()}s, max_age={MAX_EVENT_AGE_SECONDS}s, match_time={match_time.isoformat()})")
             return None
 
         # remove matched event
         match = self._snow_events[best_idx]
         del self._snow_events[best_idx]
-        print(f"[MERGER] DEBUG: matched snow[{best_idx}], delta={best_delta.total_seconds():.1f}s")
+        print(f"[MERGER] DEBUG: matched snow[{best_idx}], delta={best_delta.total_seconds():.1f}s, "
+              f"photo_size={len(match.photo_bytes) if match.photo_bytes else 0} bytes")
         return match
 
     def restore_snow_event(self, snow_event: SnowEvent) -> None:
@@ -175,14 +218,22 @@ class EventMerger:
 
     def _cleanup_loop(self) -> None:
         """
-        Периодически чистит просроченные снеговые события, даже если нет новых запросов.
+        Периодически чистит просроченные снеговые события и логирует состояние очереди.
+        Проверка происходит каждые 2 секунды для диагностики.
         """
-        interval = max(1, int(self.ttl.total_seconds() / 2) or 1)
+        interval = 2.0  # Проверка каждые 2 секунды
         while not self._stop_cleanup.is_set():
             time.sleep(interval)
             now = datetime.now(tz=timezone.utc)
             with self._lock:
                 self._cleanup(now)
+                # Логируем состояние очереди для диагностики
+                if len(self._snow_events) > 0:
+                    oldest_age = (now - self._snow_events[0].event_time).total_seconds()
+                    newest_age = (now - self._snow_events[-1].event_time).total_seconds()
+                    print(f"[MERGER] QUEUE STATUS: size={len(self._snow_events)}, "
+                          f"oldest_age={oldest_age:.1f}s, newest_age={newest_age:.1f}s, "
+                          f"window={self.window.total_seconds()}s, ttl={self.ttl.total_seconds()}s")
 
     def _get_gemini_client(self) -> genai.Client:
         if self._gemini_client is None:
@@ -334,24 +385,42 @@ class EventMerger:
         anpr_time_str = str(anpr_event.get("event_time", ""))
         anpr_time = _parse_iso_dt(anpr_time_str) or now
         
-        print(f"[MERGER] DEBUG: anpr_event_time_str='{anpr_time_str}', parsed={anpr_time.isoformat()}, now={now.isoformat()}")
+        # Логируем разницу между временем ANPR и текущим временем для диагностики
+        anpr_time_diff = (now - anpr_time).total_seconds()
+        print(f"[MERGER] DEBUG: anpr_event_time_str='{anpr_time_str}', parsed={anpr_time.isoformat()}, "
+              f"now={now.isoformat()}, anpr_time_diff={anpr_time_diff:.2f}s")
 
         with self._lock:
-            self._cleanup(anpr_time)  # Используем anpr_time вместо now для корректной очистки
+            # ВАЖНО: очистка должна использовать текущее время (now), а не anpr_time!
+            # Если anpr_time в будущем (неправильные часы камеры), очистка по anpr_time удалит все события
+            self._cleanup(now)
             snow_event = self._pop_match(anpr_time)
 
         # Если снег еще не пришел, и разрешено подождать — ждём до заданного таймаута
+        # Проверяем каждые 0.2 секунды (как было), но также логируем состояние очереди
         if snow_event is None and WAIT_FOR_SNOW_SECONDS > 0:
             wait_deadline = datetime.now(tz=timezone.utc) + timedelta(seconds=min(WAIT_FOR_SNOW_SECONDS, self.window.total_seconds()))
-            print(f"[MERGER] no snow match yet, waiting up to { (wait_deadline - datetime.now(tz=timezone.utc)).total_seconds():.1f}s for late snow...")
+            wait_duration = (wait_deadline - datetime.now(tz=timezone.utc)).total_seconds()
+            print(f"[MERGER] no snow match yet, waiting up to {wait_duration:.1f}s for late snow...")
+            check_count = 0
             while datetime.now(tz=timezone.utc) < wait_deadline:
                 await asyncio.sleep(0.2)
+                check_count += 1
                 with self._lock:
-                    self._cleanup(anpr_time)
+                    # ВАЖНО: очистка должна использовать текущее время, а не anpr_time
+                    current_time = datetime.now(tz=timezone.utc)
+                    self._cleanup(current_time)
+                    queue_size_before = len(self._snow_events)
                     snow_event = self._pop_match(anpr_time)
+                    queue_size_after = len(self._snow_events)
                 if snow_event:
-                    print("[MERGER] found late snow match while waiting")
+                    print(f"[MERGER] found late snow match while waiting (after {check_count * 0.2:.1f}s, {check_count} checks)")
                     break
+                # Логируем каждые 5 проверок (раз в секунду), чтобы не спамить
+                if check_count % 5 == 0:
+                    elapsed = check_count * 0.2
+                    remaining = wait_duration - elapsed
+                    print(f"[MERGER] still waiting for snow match (elapsed={elapsed:.1f}s, remaining={remaining:.1f}s, queue_size={queue_size_before})")
 
         combined_event = dict(anpr_event)
         snow_analysis = None
