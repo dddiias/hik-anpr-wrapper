@@ -33,14 +33,28 @@ MIDDLE_ZONE_END_X = float(os.getenv("SNOW_MIDDLE_ZONE_END_X", "0.65"))
 MIN_DIRECTION_DELTA = int(os.getenv("SNOW_MIN_DIRECTION_DELTA", "5"))
 MISS_RESET_THRESHOLD_ENV = int(os.getenv("SNOW_MISS_RESET_THRESHOLD", "3"))
 STATIONARY_TIMEOUT_SECONDS = float(os.getenv("SNOW_STATIONARY_TIMEOUT_SECONDS", "10.0"))  # Если машина стоит > N сек, сбрасываем трекинг
+STATIONARY_SOFT_TIMEOUT_SECONDS = float(os.getenv("SNOW_STATIONARY_SOFT_TIMEOUT_SECONDS", "3.0"))  # Мягкий порог: стоячую машину быстрее игнорируем
 R2L_CONFIRM_THRESHOLD = int(os.getenv("SNOW_R2L_CONFIRM_THRESHOLD", "5"))  # После N подтверждений R→L игнорируем машину
 STATIONARY_HARD_TIMEOUT_SECONDS = float(os.getenv("SNOW_STATIONARY_HARD_TIMEOUT_SECONDS", "60.0"))  # После 1 минуты стоянки игнорируем машину
 LEAVE_RESET_THRESHOLD = int(os.getenv("SNOW_LEAVE_RESET_THRESHOLD", "12"))  # Сколько кадров подряд без детекта считать, что машина ушла
+# Разделение по полосам: ниже границы — ближняя (lane 1, приоритет), выше — дальняя (lane 2)
+LANE_SPLIT_Y_RATIO = float(os.getenv("SNOW_LANE_SPLIT_Y_RATIO", "0.55"))
 
 SHOW_WINDOW = os.getenv("SNOW_SHOW_WINDOW", "false").lower() == "true"
 
 _snow_thread: threading.Thread | None = None
 _stop_event = threading.Event()
+
+# === Троттлинг повторяющихся логов ===
+LOG_THROTTLE_STATE = {}
+
+
+def log_throttled(key: str, msg: str, interval: float = 2.0) -> None:
+    now = time.time()
+    last = LOG_THROTTLE_STATE.get(key, 0.0)
+    if now - last >= interval:
+        LOG_THROTTLE_STATE[key] = now
+        print(msg)
 
 
 # === Вспомогательные функции из старого снежного сервиса ===
@@ -153,6 +167,8 @@ def _snow_loop(upstream_url: str):
     merger = init_merger(upstream_url)
 
     cap = cv2.VideoCapture(SNOW_VIDEO_SOURCE_URL)
+    # Минимизируем буфер, чтобы уменьшить задержку потока
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
     if not cap.isOpened():
         print(f"[SNOW] cannot open video source: {SNOW_VIDEO_SOURCE_URL}")
         return
@@ -187,7 +203,10 @@ def _snow_loop(upstream_url: str):
 
     print("[SNOW] worker started")
     while not _stop_event.is_set():
-        ret, frame = cap.read()
+        # Сбрасываем накопленный буфер (до 3 кадров), чтобы уменьшить задержку потока
+        for _ in range(3):
+            cap.grab()
+        ret, frame = cap.retrieve()
         if not ret or frame is None or frame.size == 0:
             fail_count += 1
             print(f"[SNOW] read fail {fail_count}")
@@ -196,6 +215,7 @@ def _snow_loop(upstream_url: str):
                 cap.release()
                 time.sleep(2)
                 cap = cv2.VideoCapture(SNOW_VIDEO_SOURCE_URL)
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
                 fail_count = 0
             time.sleep(0.05)
             continue
@@ -340,6 +360,10 @@ def _snow_loop(upstream_url: str):
                 # Дополнительная визуализация только если окно включено
                 pass
 
+            # Определяем полосу по вертикали кадра: lane 1 (ближняя) приоритетнее, lane 2 (дальняя)
+            lane_split_y = int(frame_height * LANE_SPLIT_Y_RATIO)
+            lane = 1 if center_y_obj >= lane_split_y else 2
+
             # Сохраняем снапшот и кладем в очередь без анализа, если:
             # 1. Грузовик в зоне
             # 2. Движется слева направо (подтверждено) ИЛИ это первое обнаружение в левой части зоны
@@ -348,8 +372,8 @@ def _snow_loop(upstream_url: str):
             # 4. Машина не стоит слишком долго (если не первое обнаружение)
             # 5. НЕ было движения справа налево (ни в текущем кадре, ни в предыдущих)
             is_first_on_left_side = is_first_detection and center_x_obj < center_x_geom and not current_frame_r_to_l and not last_truck_was_r_to_l
-            in_middle_zone = center_start_px + int((center_end_px - center_start_px) * (MIDDLE_ZONE_START_X - CENTER_ZONE_START_X) / (CENTER_ZONE_END_X - CENTER_ZONE_START_X)) <= center_x_obj <= \
-                              center_start_px + int((center_end_px - center_start_px) * (MIDDLE_ZONE_END_X - CENTER_ZONE_START_X) / (CENTER_ZONE_END_X - CENTER_ZONE_START_X))
+            # Убираем строгую «среднюю зону» — она часто блокировала событие
+            in_middle_zone = True
             
             # Проверяем, не стоит ли машина слишком долго
             should_process_truck = True
@@ -376,6 +400,20 @@ def _snow_loop(upstream_url: str):
                     last_truck_was_r_to_l = False  # Стоячая машина - сбрасываем флаг R→L
                     r2l_confirmations = 0
                     should_process_truck = False  # Пропускаем дальнейшую обработку для этой стоячей машины
+                elif time_since_movement > STATIONARY_SOFT_TIMEOUT_SECONDS and not moving_right:
+                    # Мягкий порог: стоячая машина без движения L→R — игнорируем, чтобы не блокировать очередь
+                    log_throttled(
+                        "stationary_soft",
+                        f"[SNOW] truck stationary soft timeout ({time_since_movement:.1f}s > {STATIONARY_SOFT_TIMEOUT_SECONDS}s), ignoring this truck until it moves"
+                    )
+                    ignore_current_truck = True
+                    last_center_x = None
+                    event_sent_for_current_truck = False
+                    last_movement_time = None
+                    last_truck_bbox = None
+                    last_truck_was_r_to_l = False
+                    r2l_confirmations = 0
+                    should_process_truck = False
             
             # Обрабатываем только если машина не стоит слишком долго
             if should_process_truck:
@@ -390,7 +428,7 @@ def _snow_loop(upstream_url: str):
                     and not current_frame_r_to_l
                     and not last_truck_was_r_to_l
                     and not ignore_current_truck
-                    and (in_middle_zone or moving_right)  # Если движется L→R, не требуем строгую среднюю зону
+                    and (lane == 1 or moving_right)  # Полоса 1 (ближняя) приоритетна; дальнюю берём только при подтвержденном движении
                 )
                 
                 # Подробное логирование для диагностики (всегда логируем, если машина в зоне и событие еще не отправлено)
