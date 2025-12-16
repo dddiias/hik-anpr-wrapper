@@ -340,6 +340,10 @@ async def hikvision_isapi(request: Request):
                     part_path.write_bytes(file_bytes)
                     camera_xml_path = str(part_path)
                     camera_info = parse_anpr_xml(file_bytes)
+                    # Логируем номер от камеры сразу после парсинга
+                    camera_plate_detected = camera_info.get("plate")
+                    if camera_plate_detected:
+                        print(f"[HIK] CAMERA DETECTED PLATE: '{camera_plate_detected}' (from anpr.xml)")
                     continue
 
                 # Картинки держим в памяти, на диск не кладём
@@ -358,6 +362,9 @@ async def hikvision_isapi(request: Request):
                             model_det_conf = anpr_res.get("det_conf")
                             model_ocr_conf = anpr_res.get("ocr_conf")
                             model_bbox = anpr_res.get("bbox")
+                            # Логируем номер от модели сразу после распознавания
+                            if model_plate:
+                                print(f"[HIK] MODEL DETECTED PLATE: '{model_plate}' (det_conf={model_det_conf}, ocr_conf={model_ocr_conf})")
 
                     elif lower_name == "featurepicture.jpg":
                         feature_bytes = file_bytes
@@ -394,6 +401,10 @@ async def hikvision_isapi(request: Request):
 
         # основной номер события для поля plate (обязателен для бэкенда)
         main_plate = model_plate or camera_plate
+        
+        # Логируем итоговый номер, который будет использован (даже если не в вайт-листе)
+        if main_plate:
+            print(f"[HIK] FINAL PLATE: '{main_plate}' (camera_plate='{camera_plate}', model_plate='{model_plate}')")
 
         # Проверка: есть ли anpr.xml от камеры
         has_anpr_xml = camera_xml_path is not None
@@ -599,6 +610,10 @@ async def hikvision_isapi(request: Request):
     model_det_conf = anpr_res.get("det_conf")
     model_ocr_conf = anpr_res.get("ocr_conf")
     model_bbox = anpr_res.get("bbox")
+    
+    # Логируем номер от модели сразу после распознавания (fallback вариант)
+    if model_plate:
+        print(f"[HIK] MODEL DETECTED PLATE (fallback): '{model_plate}' (det_conf={model_det_conf}, ocr_conf={model_ocr_conf})")
 
     # Используем UTC timezone для RFC3339 формата (требуется Go)
     now_utc = datetime.datetime.now(datetime.timezone.utc)
@@ -606,6 +621,10 @@ async def hikvision_isapi(request: Request):
 
     # тут камеры нет, только модель
     main_plate = model_plate
+    
+    # Логируем итоговый номер (fallback вариант)
+    if main_plate:
+        print(f"[HIK] FINAL PLATE (fallback): '{main_plate}'")
 
     # Проверка: есть ли нормальный номер (не None и не пустая строка)
     has_valid_plate = main_plate and main_plate.strip() and main_plate != "unknown"
