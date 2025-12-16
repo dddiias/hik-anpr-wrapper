@@ -18,17 +18,24 @@ SNOW_YOLO_MODEL_PATH = os.getenv("SNOW_YOLO_MODEL_PATH", "yolov8n.pt")
 
 TRUCK_CLASS_ID = int(os.getenv("SNOW_TRUCK_CLASS_ID", "7"))
 CONFIDENCE_THRESHOLD = float(os.getenv("SNOW_CONFIDENCE_THRESHOLD", "0.55"))
+MIN_BBOX_AREA = int(os.getenv("SNOW_MIN_BBOX_AREA", "40000"))  # Минимальная площадь bbox (px^2) для приоритета
+MIN_BBOX_W = int(os.getenv("SNOW_MIN_BBOX_W", "180"))          # Минимальная ширина bbox
+MIN_BBOX_H = int(os.getenv("SNOW_MIN_BBOX_H", "120"))          # Минимальная высота bbox
+BBOX_EDGE_MARGIN = int(os.getenv("SNOW_BBOX_EDGE_MARGIN", "10"))  # Отступ от краев кадра, ближе — штрафуем
 
 CENTER_ZONE_START_X = float(os.getenv("SNOW_CENTER_ZONE_START_X", "0.15"))
 CENTER_ZONE_END_X = float(os.getenv("SNOW_CENTER_ZONE_END_X", "0.85"))
 CENTER_ZONE_START_Y = float(os.getenv("SNOW_CENTER_ZONE_START_Y", "0.0"))  # Начало зоны по вертикали (0 = верх)
 CENTER_ZONE_END_Y = float(os.getenv("SNOW_CENTER_ZONE_END_Y", "1.0"))  # Конец зоны по вертикали (1.0 = низ, весь кадр)
 CENTER_LINE_X = float(os.getenv("SNOW_CENTER_LINE_X", "0.5"))
+MIDDLE_ZONE_START_X = float(os.getenv("SNOW_MIDDLE_ZONE_START_X", "0.35"))  # Узкая средняя зона для триггера снимка
+MIDDLE_ZONE_END_X = float(os.getenv("SNOW_MIDDLE_ZONE_END_X", "0.65"))
 MIN_DIRECTION_DELTA = int(os.getenv("SNOW_MIN_DIRECTION_DELTA", "5"))
 MISS_RESET_THRESHOLD_ENV = int(os.getenv("SNOW_MISS_RESET_THRESHOLD", "3"))
 STATIONARY_TIMEOUT_SECONDS = float(os.getenv("SNOW_STATIONARY_TIMEOUT_SECONDS", "10.0"))  # Если машина стоит > N сек, сбрасываем трекинг
 R2L_CONFIRM_THRESHOLD = int(os.getenv("SNOW_R2L_CONFIRM_THRESHOLD", "5"))  # После N подтверждений R→L игнорируем машину
 STATIONARY_HARD_TIMEOUT_SECONDS = float(os.getenv("SNOW_STATIONARY_HARD_TIMEOUT_SECONDS", "60.0"))  # После 1 минуты стоянки игнорируем машину
+LEAVE_RESET_THRESHOLD = int(os.getenv("SNOW_LEAVE_RESET_THRESHOLD", "12"))  # Сколько кадров подряд без детекта считать, что машина ушла
 
 SHOW_WINDOW = os.getenv("SNOW_SHOW_WINDOW", "false").lower() == "true"
 
@@ -40,11 +47,13 @@ _stop_event = threading.Event()
 
 def _detect_truck_bbox(frame: np.ndarray, model: YOLO) -> Optional[Tuple[int, int, int, int]]:
     """
-    Находит bbox грузовика (class=TRUCK_CLASS_ID) с приоритетом ближе к камере.
-    Приоритет: больший y2 (ниже в кадре) + площадь.
+    Находит bbox грузовика (class=TRUCK_CLASS_ID) с приоритетом ближе к камере и в центральной полосе.
+    Приоритет: больший y2 (ниже в кадре) + площадь, бонус за пересечение узкой средней зоны,
+    штраф за близость к краю, фильтр по минимальной площади/размеру.
     """
     best_box = None
     best_score = -1.0
+    fh, fw = frame.shape[:2]
 
     results = model(frame, verbose=False)
     for r in results:
@@ -57,9 +66,27 @@ def _detect_truck_bbox(frame: np.ndarray, model: YOLO) -> Optional[Tuple[int, in
             if cls_id != TRUCK_CLASS_ID or conf < CONFIDENCE_THRESHOLD:
                 continue
             x1, y1, x2, y2 = map(int, b.xyxy[0].tolist())
-            area = (x2 - x1) * (y2 - y1)
-            # Чем ниже y2 (ближе к камере) и чем больше площадь, тем выше score
-            score = y2 * 1.0 + area * 0.001
+            w = x2 - x1
+            h = y2 - y1
+            area = w * h
+
+            # Фильтр по минимальным размерам
+            if area < MIN_BBOX_AREA or w < MIN_BBOX_W or h < MIN_BBOX_H:
+                continue
+
+            # Пересечение узкой средней зоны по X (используем глобальные коэффициенты)
+            mid_start = int(fw * MIDDLE_ZONE_START_X)
+            mid_end = int(fw * MIDDLE_ZONE_END_X)
+            overlaps_mid = not (x2 < mid_start or x1 > mid_end)
+
+            # Бонус/штраф
+            score = y2 * 1.0 + area * 0.0005
+            if overlaps_mid:
+                score += 1000.0
+            # Штраф за близость к краям кадра
+            if x1 <= BBOX_EDGE_MARGIN or x2 >= fw - BBOX_EDGE_MARGIN or y1 <= BBOX_EDGE_MARGIN or y2 >= fh - BBOX_EDGE_MARGIN:
+                score -= 1500.0
+
             if score > best_score:
                 best_score = score
                 best_box = (x1, y1, x2, y2)
@@ -71,6 +98,8 @@ def _check_center_zone(bbox, frame_width: int, frame_height: int):
     Проверка: bbox пересекается с центральной зоной по X и Y (не только центр).
     Это позволяет захватывать машины, которые едут близко к краю зоны, включая нижнюю часть кадра.
     """
+    # Небольшое сужение зоны от краёв кадра, чтобы не реагировать на объекты вне сцены
+    TRIM_MARGIN = 0.02  # 2% от кадра по каждой стороне
     x1, y1, x2, y2 = bbox
     center_x = x1 + (x2 - x1) // 2
     center_y = y1 + (y2 - y1) // 2
@@ -82,6 +111,14 @@ def _check_center_zone(bbox, frame_width: int, frame_height: int):
     # Зона по вертикали (Y) - теперь учитываем нижнюю часть кадра
     zone_start_py = int(frame_height * CENTER_ZONE_START_Y)
     zone_end_py = int(frame_height * CENTER_ZONE_END_Y)
+
+    # Дополнительно отступаем от краёв кадра на margin, чтобы не ловить почти вышедшие за кадр объекты
+    margin_x = int(frame_width * TRIM_MARGIN)
+    margin_y = int(frame_height * TRIM_MARGIN)
+    zone_start_px = max(zone_start_px, margin_x)
+    zone_end_px = min(zone_end_px, frame_width - margin_x)
+    zone_start_py = max(zone_start_py, margin_y)
+    zone_end_py = min(zone_end_py, frame_height - margin_y)
     
     # Проверяем пересечение bbox с зоной по обеим осям
     # Грузовик считается в зоне, если хотя бы часть его bbox пересекается с зоной
@@ -146,6 +183,7 @@ def _snow_loop(upstream_url: str):
     frame_count = 0
     miss_count = 0          # Счетчик подряд идущих кадров без детекции
     MISS_RESET_THRESHOLD = MISS_RESET_THRESHOLD_ENV  # После скольких пропусков сбрасывать трекинг
+    leave_count = 0         # Счетчик подряд идущих кадров без детекции для определения, что машина ушла
 
     print("[SNOW] worker started")
     while not _stop_event.is_set():
@@ -186,6 +224,7 @@ def _snow_loop(upstream_url: str):
 
         bbox = _detect_truck_bbox(raw_frame, model)
         if bbox:
+            leave_count = 0  # Есть детекция — сбрасываем счетчик ухода
             in_zone, center_x_obj, center_y_obj, zone_start_px, zone_end_px, zone_start_py, zone_end_py = _check_center_zone(bbox, frame_width, frame_height)
             
             # Проверяем, не сменилась ли машина (по значительному изменению bbox)
@@ -274,14 +313,16 @@ def _snow_loop(upstream_url: str):
                 else:
                     print(f"[SNOW] truck moving left-to-right (center_x={center_x_obj:.1f}px), tracking updated")
             # Если грузовик движется справа налево - сбрасываем отслеживание
+            # Это уезжающие машины, их нужно игнорировать
             elif last_center_x is not None:
                 delta = center_x_obj - last_center_x
-                if delta < -MIN_DIRECTION_DELTA:  # Движение справа налево
-                    print(f"[SNOW] truck moving right-to-left (delta={delta:.1f}px), resetting tracking, setting R→L flag")
+                if delta < -MIN_DIRECTION_DELTA:  # Движение справа налево (уезжающая машина)
+                    print(f"[SNOW] FILTERED: truck moving right-to-left (delta={delta:.1f}px) - exiting vehicle, resetting tracking, setting R→L flag")
                     last_center_x = None
                     event_sent_for_current_truck = False
                     last_movement_time = None
                     last_truck_was_r_to_l = True  # Сохраняем флаг R→L для следующих кадров
+                    ignore_current_truck = True  # Явно игнорируем уезжающую машину
                 elif abs(delta) <= MIN_DIRECTION_DELTA:
                     # Грузовик стоит на месте или движется очень медленно
                     print(f"[SNOW] truck stationary or slow (delta={delta:.1f}px), keeping position")
@@ -303,12 +344,12 @@ def _snow_loop(upstream_url: str):
 
             # Сохраняем снапшот и кладем в очередь без анализа, если:
             # 1. Грузовик в зоне
-            # 2. Движется слева направо (подтверждено) ИЛИ это первое обнаружение в левой части зоны
-            #    (ожидаем движение слева направо), чтобы быстрые машины не терять
+            # 2. Движется слева направо (подтверждено) ИЛИ это первое обнаружение в зоне
             # 3. Еще не отправлено событие для этого грузовика
             # 4. Машина не стоит слишком долго (если не первое обнаружение)
-            # 5. НЕ было движения справа налево (ни в текущем кадре, ни в предыдущих)
-            is_first_on_left_side = is_first_detection and center_x_obj < center_x_geom and not current_frame_r_to_l and not last_truck_was_r_to_l
+            # 5. НЕ движется справа налево в текущем кадре
+            in_middle_zone = center_start_px + int((center_end_px - center_start_px) * (MIDDLE_ZONE_START_X - CENTER_ZONE_START_X) / (CENTER_ZONE_END_X - CENTER_ZONE_START_X)) <= center_x_obj <= \
+                              center_start_px + int((center_end_px - center_start_px) * (MIDDLE_ZONE_END_X - CENTER_ZONE_START_X) / (CENTER_ZONE_END_X - CENTER_ZONE_START_X))
             
             # Проверяем, не стоит ли машина слишком долго
             should_process_truck = True
@@ -338,27 +379,45 @@ def _snow_loop(upstream_url: str):
             
             # Обрабатываем только если машина не стоит слишком долго
             if should_process_truck:
-                # НЕ добавляем событие, если машина движется справа налево
-                # Даже если это "первое обнаружение в левой части", если мы видели движение R→L, это не заезд
+                # Упрощенные условия для добавления события:
+                # 1. Машина в зоне
+                # 2. Еще не отправлено событие для этого грузовика
+                # 3. Движется слева направо ИЛИ это первое обнаружение в зоне
+                # 4. НЕ движется справа налево в текущем кадре
+                # 5. НЕ игнорируется (не было подтвержденного движения R→L)
+                # Убрали требование in_middle_zone для упрощения - если машина в зоне и движется L→R, добавляем
                 should_add_event = (
                     in_zone
                     and not event_sent_for_current_truck
-                    and (moving_right or is_first_on_left_side)
+                    and (moving_right or is_first_detection)  # Упростили: движется L→R ИЛИ первое обнаружение
                     and not current_frame_r_to_l
-                    and not last_truck_was_r_to_l
                     and not ignore_current_truck
                 )
                 
-                # Подробное логирование для диагностики (только если не первое обнаружение или есть движение)
-                if in_zone and not event_sent_for_current_truck and (is_first_detection or moving_right):
+                # Подробное логирование для диагностики (всегда логируем, если машина в зоне и событие еще не отправлено)
+                if in_zone and not event_sent_for_current_truck:
                     print(
                         "[SNOW] DEBUG: in_zone=True, event_sent=False, "
                         f"moving_right={moving_right}, is_first_detection={is_first_detection}, "
-                        f"is_first_on_left_side={is_first_on_left_side}, "
-                        f"current_frame_r_to_l={current_frame_r_to_l}, last_truck_was_r_to_l={last_truck_was_r_to_l}, "
+                        f"current_frame_r_to_l={current_frame_r_to_l}, "
+                        f"ignore_current_truck={ignore_current_truck}, in_middle_zone={in_middle_zone}, "
                         f"center_x={center_x_obj:.1f}px, center_x_geom={center_x_geom}px, "
                         f"should_add_event={should_add_event}"
                     )
+                    if not should_add_event:
+                        # Детальная диагностика, почему событие не добавляется
+                        reasons = []
+                        if not in_zone:
+                            reasons.append("not in zone")
+                        if event_sent_for_current_truck:
+                            reasons.append("event already sent")
+                        if not (moving_right or is_first_detection):
+                            reasons.append(f"not moving right and not first detection (moving_right={moving_right}, is_first_detection={is_first_detection})")
+                        if current_frame_r_to_l:
+                            reasons.append("current frame R→L")
+                        if ignore_current_truck:
+                            reasons.append("truck ignored")
+                        print(f"[SNOW] DEBUG: event NOT added, reasons: {', '.join(reasons) if reasons else 'unknown'}")
                 
                 if should_add_event:
                     print(f"[SNOW] ===== ENCODING SNAPSHOT AND QUEUING (IN-MEMORY) ======")
@@ -386,7 +445,9 @@ def _snow_loop(upstream_url: str):
                     print(f"[SNOW] payload queued (no Gemini yet): {payload}")
 
                     merger.add_snow_event(payload, photo_bytes)
-                    print(f"[SNOW] snow event added to queue, queue_size should increase")
+                    print(f"[SNOW] snow event added to queue at {ts_saved.isoformat()}, "
+                          f"photo_size={len(photo_bytes) if photo_bytes else 0} bytes, "
+                          f"queue_size should increase")
                     event_sent_for_current_truck = True
                     last_truck_bbox = bbox  # Сохраняем bbox для отслеживания смены машины
                 elif in_zone and not moving_right and last_center_x is not None and not event_sent_for_current_truck:
@@ -411,17 +472,22 @@ def _snow_loop(upstream_url: str):
         else:
             # Грузовик не детектирован - даем небольшой допуск на пропуски
             miss_count += 1
-            if miss_count >= MISS_RESET_THRESHOLD:
-                if last_truck_bbox is not None or last_center_x is not None:
-                    print(f"[SNOW] no truck detected for {miss_count} frames, resetting tracking for next truck")
+            leave_count += 1
+
+            # Если подряд много пропусков, считаем что машина ушла из кадра и разрешаем новые события
+            if leave_count >= LEAVE_RESET_THRESHOLD:
+                if last_truck_bbox is not None or last_center_x is not None or event_sent_for_current_truck:
+                    print(f"[SNOW] truck likely left scene (no detect for {leave_count} frames), resetting tracking for next truck")
                 event_sent_for_current_truck = False
                 last_center_x = None
                 last_movement_time = None
                 last_truck_bbox = None
-                last_truck_was_r_to_l = False  # Машина не детектируется - сбрасываем флаг R→L
+                last_truck_was_r_to_l = False
                 r2l_confirmations = 0
                 ignore_current_truck = False
+                leave_count = 0
                 miss_count = 0
+
             # Небольшая пауза, чтобы не крутить цикл слишком быстро при пропусках
             time.sleep(0.02)
 
