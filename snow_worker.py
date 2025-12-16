@@ -313,14 +313,16 @@ def _snow_loop(upstream_url: str):
                 else:
                     print(f"[SNOW] truck moving left-to-right (center_x={center_x_obj:.1f}px), tracking updated")
             # Если грузовик движется справа налево - сбрасываем отслеживание
+            # Это уезжающие машины, их нужно игнорировать
             elif last_center_x is not None:
                 delta = center_x_obj - last_center_x
-                if delta < -MIN_DIRECTION_DELTA:  # Движение справа налево
-                    print(f"[SNOW] truck moving right-to-left (delta={delta:.1f}px), resetting tracking, setting R→L flag")
+                if delta < -MIN_DIRECTION_DELTA:  # Движение справа налево (уезжающая машина)
+                    print(f"[SNOW] FILTERED: truck moving right-to-left (delta={delta:.1f}px) - exiting vehicle, resetting tracking, setting R→L flag")
                     last_center_x = None
                     event_sent_for_current_truck = False
                     last_movement_time = None
                     last_truck_was_r_to_l = True  # Сохраняем флаг R→L для следующих кадров
+                    ignore_current_truck = True  # Явно игнорируем уезжающую машину
                 elif abs(delta) <= MIN_DIRECTION_DELTA:
                     # Грузовик стоит на месте или движется очень медленно
                     print(f"[SNOW] truck stationary or slow (delta={delta:.1f}px), keeping position")
@@ -342,12 +344,10 @@ def _snow_loop(upstream_url: str):
 
             # Сохраняем снапшот и кладем в очередь без анализа, если:
             # 1. Грузовик в зоне
-            # 2. Движется слева направо (подтверждено) ИЛИ это первое обнаружение в левой части зоны
-            #    (ожидаем движение слева направо), чтобы быстрые машины не терять
+            # 2. Движется слева направо (подтверждено) ИЛИ это первое обнаружение в зоне
             # 3. Еще не отправлено событие для этого грузовика
             # 4. Машина не стоит слишком долго (если не первое обнаружение)
-            # 5. НЕ было движения справа налево (ни в текущем кадре, ни в предыдущих)
-            is_first_on_left_side = is_first_detection and center_x_obj < center_x_geom and not current_frame_r_to_l and not last_truck_was_r_to_l
+            # 5. НЕ движется справа налево в текущем кадре
             in_middle_zone = center_start_px + int((center_end_px - center_start_px) * (MIDDLE_ZONE_START_X - CENTER_ZONE_START_X) / (CENTER_ZONE_END_X - CENTER_ZONE_START_X)) <= center_x_obj <= \
                               center_start_px + int((center_end_px - center_start_px) * (MIDDLE_ZONE_END_X - CENTER_ZONE_START_X) / (CENTER_ZONE_END_X - CENTER_ZONE_START_X))
             
@@ -379,18 +379,19 @@ def _snow_loop(upstream_url: str):
             
             # Обрабатываем только если машина не стоит слишком долго
             if should_process_truck:
-                # НЕ добавляем событие, если машина движется справа налево
-                # Даже если это "первое обнаружение в левой части", если мы видели движение R→L, это не заезд
-                # Смягчаем условие: если машина в зоне и движется L→R, добавляем событие даже если не в строгой средней зоне
-                # Это помогает не пропускать быстрые машины
+                # Упрощенные условия для добавления события:
+                # 1. Машина в зоне
+                # 2. Еще не отправлено событие для этого грузовика
+                # 3. Движется слева направо ИЛИ это первое обнаружение в зоне
+                # 4. НЕ движется справа налево в текущем кадре
+                # 5. НЕ игнорируется (не было подтвержденного движения R→L)
+                # Убрали требование in_middle_zone для упрощения - если машина в зоне и движется L→R, добавляем
                 should_add_event = (
                     in_zone
                     and not event_sent_for_current_truck
-                    and (moving_right or is_first_on_left_side)
+                    and (moving_right or is_first_detection)  # Упростили: движется L→R ИЛИ первое обнаружение
                     and not current_frame_r_to_l
-                    and not last_truck_was_r_to_l
                     and not ignore_current_truck
-                    and (in_middle_zone or moving_right)  # Если движется L→R, не требуем строгую среднюю зону
                 )
                 
                 # Подробное логирование для диагностики (всегда логируем, если машина в зоне и событие еще не отправлено)
@@ -398,8 +399,7 @@ def _snow_loop(upstream_url: str):
                     print(
                         "[SNOW] DEBUG: in_zone=True, event_sent=False, "
                         f"moving_right={moving_right}, is_first_detection={is_first_detection}, "
-                        f"is_first_on_left_side={is_first_on_left_side}, "
-                        f"current_frame_r_to_l={current_frame_r_to_l}, last_truck_was_r_to_l={last_truck_was_r_to_l}, "
+                        f"current_frame_r_to_l={current_frame_r_to_l}, "
                         f"ignore_current_truck={ignore_current_truck}, in_middle_zone={in_middle_zone}, "
                         f"center_x={center_x_obj:.1f}px, center_x_geom={center_x_geom}px, "
                         f"should_add_event={should_add_event}"
@@ -411,16 +411,12 @@ def _snow_loop(upstream_url: str):
                             reasons.append("not in zone")
                         if event_sent_for_current_truck:
                             reasons.append("event already sent")
-                        if not (moving_right or is_first_on_left_side):
-                            reasons.append(f"not moving right (moving_right={moving_right}, is_first_on_left_side={is_first_on_left_side})")
+                        if not (moving_right or is_first_detection):
+                            reasons.append(f"not moving right and not first detection (moving_right={moving_right}, is_first_detection={is_first_detection})")
                         if current_frame_r_to_l:
                             reasons.append("current frame R→L")
-                        if last_truck_was_r_to_l:
-                            reasons.append("last truck was R→L")
                         if ignore_current_truck:
                             reasons.append("truck ignored")
-                        if not (in_middle_zone or moving_right):
-                            reasons.append(f"not in middle zone and not moving right (in_middle_zone={in_middle_zone}, moving_right={moving_right})")
                         print(f"[SNOW] DEBUG: event NOT added, reasons: {', '.join(reasons) if reasons else 'unknown'}")
                 
                 if should_add_event:

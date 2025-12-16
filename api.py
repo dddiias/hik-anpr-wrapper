@@ -155,13 +155,32 @@ def parse_anpr_xml(xml_bytes: bytes) -> Dict[str, Any]:
         except ValueError:
             camera_conf = None
 
-    return {
+    # Парсим direction из XML, если он есть
+    direction = txt_anpr("isapi:direction") or txt("isapi:direction")
+    
+    # Парсим lane из XML, если он есть
+    lane_str = txt_anpr("isapi:lane") or txt("isapi:lane")
+    lane = None
+    if lane_str:
+        try:
+            lane = int(lane_str)
+        except ValueError:
+            lane = None
+
+    result = {
         "event_type": event_type,
         "date_time": date_time,
         "plate": plate,
         "original_plate": original_plate,
         "confidence": camera_conf,
     }
+    
+    if direction:
+        result["direction"] = direction
+    if lane is not None:
+        result["lane"] = lane
+    
+    return result
 
 
 # === Отправка события и фотографий на внешний сервис ===
@@ -479,6 +498,42 @@ async def hikvision_isapi(request: Request):
         if license_bytes:
             files_info.append(f"license({len(license_bytes)} bytes)")
         print(f"[HIK] files to send: {files_info if files_info else 'NONE'}")
+        
+        # Фильтрация событий от уезжающих машин
+        # Проверяем direction и event_type, чтобы отфильтровать выезжающие машины
+        direction = event_data.get("direction", "").lower()
+        event_type = camera_info.get("event_type", "").lower() if camera_info else ""
+        
+        # Фильтруем события, если:
+        # 1. direction указывает на выезд (например, "out", "exit", "leaving", "departure")
+        # 2. event_type указывает на выезд (например, "vehicleexit", "departure")
+        # 3. direction содержит "left" или "right" в контексте выезда (но не "left lane" или "right lane")
+        is_exiting = False
+        exit_keywords = ["out", "exit", "leaving", "departure", "away"]
+        
+        if direction and any(keyword in direction for keyword in exit_keywords):
+            is_exiting = True
+            print(f"[HIK] FILTERED: event filtered - direction='{direction}' indicates vehicle is exiting")
+        
+        if event_type and any(keyword in event_type for keyword in exit_keywords):
+            is_exiting = True
+            print(f"[HIK] FILTERED: event filtered - event_type='{event_type}' indicates vehicle is exiting")
+        
+        if is_exiting:
+            # Логируем отфильтрованное событие
+            log_event = {
+                **event_data,
+                "upstream_sent": False,
+                "upstream_status": None,
+                "upstream_error": "filtered: vehicle is exiting",
+                "matched_snow": False,
+                "filtered_reason": f"direction='{direction}', event_type='{event_type}'",
+            }
+            log_path = BASE_DIR / "detections.log"
+            with log_path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(log_event, ensure_ascii=False) + "\n")
+            print(f"[HIK] Event filtered and logged, not sending to upstream")
+            return JSONResponse({"status": "ok"})
         
         upstream_result = await merger.combine_and_send(
             anpr_event=event_data,
